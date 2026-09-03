@@ -35,7 +35,7 @@ const redisUsers = {};
 const redisBanned = new Set();
 function fakeRedis([cmd, key, ...args]) {
   switch (cmd) {
-    case 'HEXISTS': return key in redisUsers ? 0 : (args[0] in redisUsers ? 1 : 0);
+    case 'HEXISTS': return args[0] in redisUsers ? 1 : 0;
     case 'HSET': redisUsers[args[0]] = args[1]; return 1;
     case 'HDEL': delete redisUsers[args[0]]; return 1;
     case 'HGETALL': return Object.entries(redisUsers).flat();
