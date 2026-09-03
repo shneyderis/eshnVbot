@@ -1,0 +1,10 @@
+{
+  "name": "wa-voice-bot",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Telegram bot: forward WhatsApp voice messages, get text back (OpenAI Whisper)",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node test.js"
+  }
+}
