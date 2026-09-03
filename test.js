@@ -32,6 +32,12 @@ global.fetch = async (url, opts = {}) => {
   if (url.includes('/getFile')) return json({ ok: true, result: { file_path: 'documents/file_0.opus' } });
   if (url.includes('/sendMessage') || url.includes('/sendChatAction')) return json({ ok: true, result: {} });
   if (url.includes('/file/bot')) return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
+  if (url.includes('chat/completions')) {
+    const body = JSON.parse(opts.body);
+    const target = /into (\w+)\./.exec(body.messages[0].content)[1];
+    const content = target === 'Russian' ? '=' : 'Hello, this is a test.';
+    return json({ choices: [{ message: { content } }] });
+  }
   if (url.includes('openai.com')) {
     assert.ok(opts.body instanceof FormData);
     assert.strictEqual(opts.body.get('file').name, 'audio.ogg');
@@ -64,6 +70,30 @@ function mockRes() {
   assert.strictEqual(sent.length, 1);
   assert.strictEqual(sent[0].text, 'Привет, это тест.');
   assert.strictEqual(sent[0].reply_parameters.message_id, 10);
+
+  // translation enabled: original + translation
+  process.env.TRANSLATE_TO = 'English';
+  calls.length = 0;
+  res = mockRes();
+  await bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' }, body: update }, res);
+  let msgs = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text);
+  assert.deepStrictEqual(msgs, ['🎤 Привет, это тест.', '🌐 Hello, this is a test.']);
+
+  // already in target language: no translation message
+  process.env.TRANSLATE_TO = 'Russian';
+  calls.length = 0;
+  await bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' }, body: update }, mockRes());
+  msgs = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text);
+  assert.deepStrictEqual(msgs, ['🎤 Привет, это тест.']);
+  delete process.env.TRANSLATE_TO;
+
+  // /tr as a reply
+  calls.length = 0;
+  await bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' },
+    body: { message: { message_id: 3, chat: { id: 42 }, from: { id: 42 }, text: '/tr English',
+      reply_to_message: { message_id: 2, text: '🎤 Привет, это тест.' } } } }, mockRes());
+  msgs = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text);
+  assert.deepStrictEqual(msgs, ['Hello, this is a test.']);
 
   // not allowed user
   calls.length = 0;

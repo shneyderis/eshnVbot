@@ -8,9 +8,16 @@
 //   ALLOWED_USER_IDS         comma-separated Telegram user ids allowed to use the bot (recommended)
 //   TRANSCRIBE_MODEL         default "gpt-4o-transcribe" (alternative: "whisper-1")
 //   TRANSCRIBE_LANGUAGE      optional ISO-639-1 hint ("ru", "uk", "en"); default: auto-detect
+//   TRANSLATE_TO             optional target language ("ru", "Russian", "en"...); when set, every
+//                            transcript is followed by a translation (skipped if already in that language)
+//   TRANSLATE_MODEL          default "gpt-4o-mini"
+//
+// Commands: /start; /tr <lang> as a reply to a bot message translates that text once.
 
 const TG_API = 'https://api.telegram.org';
 const OPENAI_API = 'https://api.openai.com/v1/audio/transcriptions';
+const OPENAI_CHAT_API = 'https://api.openai.com/v1/chat/completions';
+const SAME_LANGUAGE = '=';
 const TG_MAX_MESSAGE = 4096;
 // Extensions accepted by the OpenAI transcription endpoint.
 const OPENAI_EXTS = new Set(['flac', 'm4a', 'mp3', 'mp4', 'mpeg', 'mpga', 'oga', 'ogg', 'wav', 'webm']);
@@ -104,6 +111,41 @@ async function transcribe(buffer, filename) {
   return (await r.text()).trim();
 }
 
+// Returns the translation, or '' if the text is already in the target language.
+async function translate(text, target) {
+  const r = await fetch(OPENAI_CHAT_API, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: process.env.TRANSLATE_MODEL || 'gpt-4o-mini',
+      temperature: 0,
+      messages: [
+        { role: 'system', content: `You translate transcribed speech into ${target}. Reply with the translation only, no comments. Keep the meaning and tone; fix obvious transcription slips. If the text is already entirely in ${target}, reply with exactly: ${SAME_LANGUAGE}` },
+        { role: 'user', content: text },
+      ],
+    }),
+  });
+  if (!r.ok) {
+    const body = await r.text().catch(() => '');
+    throw new Error(`OpenAI translate ${r.status}: ${body.slice(0, 300)}`);
+  }
+  const data = await r.json();
+  const out = ((data.choices && data.choices[0] && data.choices[0].message.content) || '').trim();
+  return out === SAME_LANGUAGE ? '' : out;
+}
+
+async function sendLong(chatId, text, replyTo) {
+  const parts = chunk(text);
+  for (let i = 0; i < parts.length; i++) {
+    await sendText(chatId, parts[i], i === 0 ? replyTo : undefined);
+  }
+}
+
+async function replyWithTranslation(chatId, text, target, replyTo) {
+  const translated = await translate(text, target);
+  if (translated) await sendLong(chatId, `🌐 ${translated}`, replyTo);
+}
+
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
   const userId = msg.from && msg.from.id;
@@ -114,6 +156,19 @@ async function handleMessage(msg) {
   }
   if (!isAllowed(userId)) {
     await sendText(chatId, `Доступ закрыт. Твой id: ${userId}`);
+    return;
+  }
+
+  // "/tr en" as a reply to a message: translate that message's text once.
+  const tr = msg.text && /^\/tr(?:@\w+)?\s+(.+)$/i.exec(msg.text.trim());
+  if (tr) {
+    const source = msg.reply_to_message && msg.reply_to_message.text;
+    if (!source) {
+      await sendText(chatId, 'Ответь командой /tr <язык> на сообщение с текстом.');
+      return;
+    }
+    const translated = await translate(source.replace(/^[🎤🌐]\s*/u, ''), tr[1]);
+    await sendLong(chatId, translated || 'Текст уже на этом языке.', msg.message_id);
     return;
   }
 
@@ -136,10 +191,9 @@ async function handleMessage(msg) {
     await sendText(chatId, 'Не удалось распознать речь.', msg.message_id);
     return;
   }
-  const parts = chunk(text);
-  for (let i = 0; i < parts.length; i++) {
-    await sendText(chatId, parts[i], i === 0 ? msg.message_id : undefined);
-  }
+  const target = (process.env.TRANSLATE_TO || '').trim();
+  await sendLong(chatId, target ? `🎤 ${text}` : text, msg.message_id);
+  if (target) await replyWithTranslation(chatId, text, target, msg.message_id);
 }
 
 async function handler(req, res) {
