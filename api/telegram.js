@@ -5,7 +5,10 @@
 //   TELEGRAM_BOT_TOKEN       token from @BotFather (required)
 //   OPENAI_API_KEY           OpenAI API key (required)
 //   TELEGRAM_WEBHOOK_SECRET  any random string; must match the one passed to setWebhook (recommended)
-//   ALLOWED_USER_IDS         comma-separated Telegram user ids allowed to use the bot (recommended)
+//   ADMIN_USER_IDS           comma-separated Telegram user ids of admins (always allowed; can run /users, /ban, /unban)
+//   ALLOWED_USER_IDS         comma-separated Telegram user ids always allowed (optional static list)
+//   JOIN_PASSWORD            code word for self-registration via "/join <word>" (needs Redis, see lib/store.js)
+//   KV_REST_API_URL / KV_REST_API_TOKEN   Upstash Redis (added automatically by Vercel Marketplace)
 //   TRANSCRIBE_MODEL         default "gpt-4o-transcribe" (alternative: "whisper-1")
 //   TRANSCRIBE_LANGUAGE      optional ISO-639-1 hint ("ru", "uk", "en"); default: auto-detect
 //   TRANSLATE_TO             optional target language ("ru", "Russian", "en"...); when set, every
@@ -14,7 +17,13 @@
 //   SUMMARY                  "1" to follow every transcript with a short summary
 //   SUMMARY_MIN_CHARS        only summarize transcripts longer than this (default 300)
 //
-// Commands: /start; as a reply to a bot message: /tr <lang> translates it, /sum summarizes it.
+// Commands: /start, /join <word>; as a reply to a bot message: /tr <lang> translates it, /sum summarizes it.
+// Admin: /users, /ban <id>, /unban <id>.
+//
+// Access rule: if no ADMIN_USER_IDS, ALLOWED_USER_IDS and no Redis are configured, everyone is allowed.
+// Otherwise a user must be an admin, in ALLOWED_USER_IDS, or registered via /join (and not banned).
+
+const store = require('../lib/store');
 
 const TG_API = 'https://api.telegram.org';
 const OPENAI_API = 'https://api.openai.com/v1/audio/transcriptions';
@@ -89,10 +98,77 @@ function chunk(text, size = TG_MAX_MESSAGE) {
   return parts;
 }
 
-function isAllowed(userId) {
-  const raw = (process.env.ALLOWED_USER_IDS || '').trim();
-  if (!raw) return true;
-  return raw.split(/[,\s]+/).filter(Boolean).includes(String(userId));
+function idList(name) {
+  return (process.env[name] || '').split(/[,\s]+/).filter(Boolean);
+}
+
+function isAdmin(userId) {
+  return idList('ADMIN_USER_IDS').includes(String(userId));
+}
+
+async function isAllowed(userId) {
+  const admins = idList('ADMIN_USER_IDS');
+  const allowed = idList('ALLOWED_USER_IDS');
+  const id = String(userId);
+  if (admins.includes(id) || allowed.includes(id)) return true;
+  if (!admins.length && !allowed.length && !store.isConfigured()) return true; // fully open bot
+  if (!store.isConfigured()) return false;
+  return (await store.isMember(id)) && !(await store.isBanned(id));
+}
+
+function displayName(from) {
+  const name = [from.first_name, from.last_name].filter(Boolean).join(' ');
+  return from.username ? `${name} (@${from.username})` : name || String(from.id);
+}
+
+async function handleJoin(msg, word) {
+  const chatId = msg.chat.id;
+  const id = String(msg.from.id);
+  const password = (process.env.JOIN_PASSWORD || '').trim();
+  if (!password || !store.isConfigured()) {
+    await sendText(chatId, 'Регистрация по кодовому слову не настроена.');
+    return;
+  }
+  if (await store.isBanned(id)) {
+    await sendText(chatId, 'Доступ закрыт.');
+    return;
+  }
+  if (word.trim() !== password) {
+    await sendText(chatId, 'Неверное кодовое слово.');
+    return;
+  }
+  await store.addMember(id, { name: displayName(msg.from) });
+  await sendText(chatId, 'Доступ открыт. Присылай голосовые.');
+}
+
+async function handleAdmin(msg, cmd, arg) {
+  const chatId = msg.chat.id;
+  if (!store.isConfigured()) {
+    await sendText(chatId, 'Хранилище не настроено.');
+    return;
+  }
+  if (cmd === 'users') {
+    const users = await store.listMembers();
+    if (!users.length) {
+      await sendText(chatId, 'Пока никто не зарегистрирован.');
+      return;
+    }
+    const lines = users.map((u) => `${u.id} — ${u.name || ''} — ${String(u.joined || '').slice(0, 10)}`);
+    await sendLong(chatId, `Пользователи (${users.length}):\n${lines.join('\n')}`);
+    return;
+  }
+  const id = (arg || '').trim();
+  if (!/^\d+$/.test(id)) {
+    await sendText(chatId, `Использование: /${cmd} <id>`);
+    return;
+  }
+  if (cmd === 'ban') {
+    await store.ban(id);
+    await sendText(chatId, `${id} удалён и заблокирован.`);
+  } else {
+    await store.unban(id);
+    await sendText(chatId, `${id} разблокирован. Для доступа ему нужно снова /join.`);
+  }
 }
 
 async function transcribe(buffer, filename) {
@@ -178,12 +254,29 @@ async function handleMessage(msg) {
   const chatId = msg.chat.id;
   const userId = msg.from && msg.from.id;
 
-  if (msg.text && msg.text.startsWith('/start')) {
-    await sendText(chatId, `Привет. Перешли сюда голосовое (из WhatsApp: зажать → Переслать → Поделиться → Telegram), я верну текст.\n\nТвой Telegram id: ${userId}`);
+  const incoming = (msg.text || '').trim();
+  const cmd = /^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(incoming);
+  const command = cmd ? cmd[1].toLowerCase() : '';
+  const arg = cmd ? cmd[2] || '' : '';
+
+  if (command === 'start') {
+    await sendText(chatId, `Привет. Перешли сюда голосовое (из WhatsApp: зажать → Переслать → Поделиться → Telegram), я верну текст.\n\nЕсли у тебя есть кодовое слово: /join слово\nТвой Telegram id: ${userId}`);
     return;
   }
-  if (!isAllowed(userId)) {
-    await sendText(chatId, `Доступ закрыт. Твой id: ${userId}`);
+  if (command === 'join') {
+    await handleJoin(msg, arg);
+    return;
+  }
+  if (['users', 'ban', 'unban'].includes(command)) {
+    if (!isAdmin(userId)) {
+      await sendText(chatId, 'Только для админа.');
+      return;
+    }
+    await handleAdmin(msg, command, arg);
+    return;
+  }
+  if (!(await isAllowed(userId))) {
+    await sendText(chatId, `Нет доступа. Если у тебя есть кодовое слово: /join слово\nТвой id: ${userId}`);
     return;
   }
 
@@ -265,3 +358,4 @@ module.exports.pickFile = pickFile;
 module.exports.uploadName = uploadName;
 module.exports.chunk = chunk;
 module.exports.isAllowed = isAllowed;
+module.exports.isAdmin = isAdmin;

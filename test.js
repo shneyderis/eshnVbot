@@ -5,6 +5,10 @@ process.env.TELEGRAM_BOT_TOKEN = 'T';
 process.env.OPENAI_API_KEY = 'K';
 process.env.TELEGRAM_WEBHOOK_SECRET = 'S';
 process.env.ALLOWED_USER_IDS = '42';
+process.env.ADMIN_USER_IDS = '1';
+process.env.JOIN_PASSWORD = 'sesame';
+process.env.KV_REST_API_URL = 'https://redis.example';
+process.env.KV_REST_API_TOKEN = 'R';
 
 const bot = require('./api/telegram.js');
 
@@ -18,7 +22,7 @@ assert.ok(bot.pickFile({ voice: { file_id: 'v' } }));
 assert.ok(bot.pickFile({ document: { file_id: 'd', file_name: 'x.opus', mime_type: 'application/octet-stream' } }));
 assert.strictEqual(bot.pickFile({ document: { file_id: 'd', file_name: 'x.pdf', mime_type: 'application/pdf' } }), null);
 assert.strictEqual(bot.pickFile({ text: 'hi' }), null);
-assert.ok(bot.isAllowed(42) && !bot.isAllowed(7));
+assert.ok(bot.isAdmin(1) && !bot.isAdmin(42));
 const long = 'слово '.repeat(2000).trim();
 const parts = bot.chunk(long);
 assert.ok(parts.length > 1 && parts.every((p) => p.length <= 4096));
@@ -26,9 +30,28 @@ assert.strictEqual(parts.join(' '), long);
 
 // --- end-to-end with mocked network ---
 const calls = [];
+// in-memory fake of the two Redis structures the bot uses
+const redisUsers = {};
+const redisBanned = new Set();
+function fakeRedis([cmd, key, ...args]) {
+  switch (cmd) {
+    case 'HEXISTS': return key in redisUsers ? 0 : (args[0] in redisUsers ? 1 : 0);
+    case 'HSET': redisUsers[args[0]] = args[1]; return 1;
+    case 'HDEL': delete redisUsers[args[0]]; return 1;
+    case 'HGETALL': return Object.entries(redisUsers).flat();
+    case 'SISMEMBER': return redisBanned.has(args[0]) ? 1 : 0;
+    case 'SADD': redisBanned.add(args[0]); return 1;
+    case 'SREM': redisBanned.delete(args[0]); return 1;
+    default: throw new Error('unexpected redis cmd ' + cmd);
+  }
+}
 global.fetch = async (url, opts = {}) => {
   calls.push({ url: String(url), opts });
   const json = (obj) => ({ ok: true, status: 200, json: async () => obj, text: async () => JSON.stringify(obj) });
+  if (url === 'https://redis.example') {
+    assert.strictEqual(opts.headers.authorization, 'Bearer R');
+    return json({ result: fakeRedis(JSON.parse(opts.body)) });
+  }
   if (url.includes('/getFile')) return json({ ok: true, result: { file_path: 'documents/file_0.opus' } });
   if (url.includes('/sendMessage') || url.includes('/sendChatAction')) return json({ ok: true, result: {} });
   if (url.includes('/file/bot')) return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
@@ -117,15 +140,46 @@ function mockRes() {
   msgs = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text);
   assert.deepStrictEqual(msgs, ['📝 - тест']);
 
-  // not allowed user
-  calls.length = 0;
-  res = mockRes();
-  await bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' },
-    body: { message: { message_id: 1, chat: { id: 7 }, from: { id: 7 }, voice: { file_id: 'v' } } } }, res);
-  const denied = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body));
-  assert.strictEqual(denied.length, 1);
-  assert.ok(denied[0].text.startsWith('Доступ закрыт'));
+  const send = (from, extra) => {
+    calls.length = 0;
+    return bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' },
+      body: { message: { message_id: 1, chat: { id: from.id }, from, ...extra } } }, mockRes())
+      .then(() => calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text));
+  };
+  const stranger = { id: 7, first_name: 'Ivan', username: 'ivan' };
+
+  // unknown user: denied, OpenAI never called
+  let out = await send(stranger, { voice: { file_id: 'v' } });
+  assert.ok(out[0].startsWith('Нет доступа'));
   assert.ok(!calls.some((c) => c.url.includes('openai.com')));
+
+  // wrong / right password
+  out = await send(stranger, { text: '/join wrong' });
+  assert.deepStrictEqual(out, ['Неверное кодовое слово.']);
+  out = await send(stranger, { text: '/join sesame' });
+  assert.deepStrictEqual(out, ['Доступ открыт. Присылай голосовые.']);
+  out = await send(stranger, { voice: { file_id: 'v' } });
+  assert.strictEqual(out[0], 'Привет, это тест.');
+
+  // admin commands
+  out = await send(stranger, { text: '/users' });
+  assert.deepStrictEqual(out, ['Только для админа.']);
+  out = await send({ id: 1 }, { text: '/users' });
+  assert.ok(out[0].startsWith('Пользователи (1):') && out[0].includes('7 — Ivan (@ivan)'));
+  out = await send({ id: 1 }, { text: '/ban 7' });
+  assert.deepStrictEqual(out, ['7 удалён и заблокирован.']);
+  out = await send(stranger, { text: '/join sesame' });
+  assert.deepStrictEqual(out, ['Доступ закрыт.']);
+  out = await send({ id: 1 }, { text: '/unban 7' });
+  assert.ok(out[0].startsWith('7 разблокирован'));
+  out = await send(stranger, { text: '/join sesame' });
+  assert.deepStrictEqual(out, ['Доступ открыт. Присылай голосовые.']);
+  out = await send({ id: 1 }, { text: '/ban abc' });
+  assert.deepStrictEqual(out, ['Использование: /ban <id>']);
+
+  // static allowlist still works without touching Redis
+  out = await send({ id: 42 }, { voice: { file_id: 'v' } });
+  assert.strictEqual(out[0], 'Привет, это тест.');
 
   console.log('all tests passed');
 })().catch((e) => { console.error(e); process.exit(1); });
