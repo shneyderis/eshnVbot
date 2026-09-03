@@ -10,9 +10,11 @@
 //   TRANSCRIBE_LANGUAGE      optional ISO-639-1 hint ("ru", "uk", "en"); default: auto-detect
 //   TRANSLATE_TO             optional target language ("ru", "Russian", "en"...); when set, every
 //                            transcript is followed by a translation (skipped if already in that language)
-//   TRANSLATE_MODEL          default "gpt-4o-mini"
+//   TRANSLATE_MODEL          default "gpt-4o-mini" (also used for summaries)
+//   SUMMARY                  "1" to follow every transcript with a short summary
+//   SUMMARY_MIN_CHARS        only summarize transcripts longer than this (default 300)
 //
-// Commands: /start; /tr <lang> as a reply to a bot message translates that text once.
+// Commands: /start; as a reply to a bot message: /tr <lang> translates it, /sum summarizes it.
 
 const TG_API = 'https://api.telegram.org';
 const OPENAI_API = 'https://api.openai.com/v1/audio/transcriptions';
@@ -111,27 +113,53 @@ async function transcribe(buffer, filename) {
   return (await r.text()).trim();
 }
 
-// Returns the translation, or '' if the text is already in the target language.
-async function translate(text, target) {
+async function chat(system, user) {
   const r = await fetch(OPENAI_CHAT_API, {
     method: 'POST',
     headers: { authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'content-type': 'application/json' },
     body: JSON.stringify({
       model: process.env.TRANSLATE_MODEL || 'gpt-4o-mini',
       temperature: 0,
-      messages: [
-        { role: 'system', content: `You translate transcribed speech into ${target}. Reply with the translation only, no comments. Keep the meaning and tone; fix obvious transcription slips. If the text is already entirely in ${target}, reply with exactly: ${SAME_LANGUAGE}` },
-        { role: 'user', content: text },
-      ],
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
     }),
   });
   if (!r.ok) {
     const body = await r.text().catch(() => '');
-    throw new Error(`OpenAI translate ${r.status}: ${body.slice(0, 300)}`);
+    throw new Error(`OpenAI chat ${r.status}: ${body.slice(0, 300)}`);
   }
   const data = await r.json();
-  const out = ((data.choices && data.choices[0] && data.choices[0].message.content) || '').trim();
+  return ((data.choices && data.choices[0] && data.choices[0].message.content) || '').trim();
+}
+
+// Returns the translation, or '' if the text is already in the target language.
+async function translate(text, target) {
+  const out = await chat(
+    `You translate transcribed speech into ${target}. Reply with the translation only, no comments. Keep the meaning and tone; fix obvious transcription slips. If the text is already entirely in ${target}, reply with exactly: ${SAME_LANGUAGE}`,
+    text,
+  );
   return out === SAME_LANGUAGE ? '' : out;
+}
+
+// Short, no-filler summary. Written in `lang` if given, otherwise in the language of the text.
+function summarize(text, lang) {
+  const language = lang ? `Write in ${lang}.` : 'Write in the same language as the text.';
+  return chat(
+    `Summarize this transcribed voice message. Be brief and concrete: keep only facts, requests, decisions, dates, amounts, names. Drop greetings, filler and repetition. Use short bullet points ("- ") if there are several items, otherwise one or two sentences. No preamble. ${language}`,
+    text,
+  );
+}
+
+function summaryEnabled() {
+  return /^(1|true|yes|on)$/i.test((process.env.SUMMARY || '').trim());
+}
+
+function summaryMinChars() {
+  const n = parseInt(process.env.SUMMARY_MIN_CHARS, 10);
+  return Number.isFinite(n) ? n : 300;
+}
+
+function stripPrefix(text) {
+  return text.replace(/^[🎤🌐📝]\s*/u, '');
 }
 
 async function sendLong(chatId, text, replyTo) {
@@ -167,8 +195,20 @@ async function handleMessage(msg) {
       await sendText(chatId, 'Ответь командой /tr <язык> на сообщение с текстом.');
       return;
     }
-    const translated = await translate(source.replace(/^[🎤🌐]\s*/u, ''), tr[1]);
+    const translated = await translate(stripPrefix(source), tr[1]);
     await sendLong(chatId, translated || 'Текст уже на этом языке.', msg.message_id);
+    return;
+  }
+
+  // "/sum" as a reply to a message: summarize that message's text once.
+  if (msg.text && /^\/sum(?:@\w+)?\s*$/i.test(msg.text.trim())) {
+    const source = msg.reply_to_message && msg.reply_to_message.text;
+    if (!source) {
+      await sendText(chatId, 'Ответь командой /sum на сообщение с текстом.');
+      return;
+    }
+    const summary = await summarize(stripPrefix(source), (process.env.TRANSLATE_TO || '').trim());
+    await sendLong(chatId, `📝 ${summary}`, msg.message_id);
     return;
   }
 
@@ -192,8 +232,10 @@ async function handleMessage(msg) {
     return;
   }
   const target = (process.env.TRANSLATE_TO || '').trim();
-  await sendLong(chatId, target ? `🎤 ${text}` : text, msg.message_id);
+  const withSummary = summaryEnabled() && text.length > summaryMinChars();
+  await sendLong(chatId, target || withSummary ? `🎤 ${text}` : text, msg.message_id);
   if (target) await replyWithTranslation(chatId, text, target, msg.message_id);
+  if (withSummary) await sendLong(chatId, `📝 ${await summarize(text, target)}`, msg.message_id);
 }
 
 async function handler(req, res) {

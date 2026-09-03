@@ -34,6 +34,7 @@ global.fetch = async (url, opts = {}) => {
   if (url.includes('/file/bot')) return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
   if (url.includes('chat/completions')) {
     const body = JSON.parse(opts.body);
+    if (body.messages[0].content.startsWith('Summarize')) return json({ choices: [{ message: { content: '- тест' } }] });
     const target = /into (\w+)\./.exec(body.messages[0].content)[1];
     const content = target === 'Russian' ? '=' : 'Hello, this is a test.';
     return json({ choices: [{ message: { content } }] });
@@ -94,6 +95,27 @@ function mockRes() {
       reply_to_message: { message_id: 2, text: '🎤 Привет, это тест.' } } } }, mockRes());
   msgs = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text);
   assert.deepStrictEqual(msgs, ['Hello, this is a test.']);
+
+  // summary: only for long transcripts
+  process.env.SUMMARY = '1';
+  calls.length = 0;
+  await bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' }, body: update }, mockRes());
+  msgs = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text);
+  assert.deepStrictEqual(msgs, ['Привет, это тест.']); // short: no summary
+  process.env.SUMMARY_MIN_CHARS = '5';
+  calls.length = 0;
+  await bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' }, body: update }, mockRes());
+  msgs = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text);
+  assert.deepStrictEqual(msgs, ['🎤 Привет, это тест.', '📝 - тест']);
+  delete process.env.SUMMARY; delete process.env.SUMMARY_MIN_CHARS;
+
+  // /sum as a reply
+  calls.length = 0;
+  await bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' },
+    body: { message: { message_id: 4, chat: { id: 42 }, from: { id: 42 }, text: '/sum',
+      reply_to_message: { message_id: 2, text: '🎤 Привет, это тест.' } } } }, mockRes());
+  msgs = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text);
+  assert.deepStrictEqual(msgs, ['📝 - тест']);
 
   // not allowed user
   calls.length = 0;
