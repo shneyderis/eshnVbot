@@ -17,7 +17,7 @@
 //   SUMMARY                  "1" to follow every transcript with a short summary
 //   SUMMARY_MIN_CHARS        only summarize transcripts longer than this (default 300)
 //
-// Commands: /start, /join <word>; as a reply to a bot message: /tr <lang> translates it, /sum summarizes it.
+// Commands: /start, /help, /join <word>; as a reply to a bot message: /tr <lang> translates it, /sum summarizes it.
 // Admin: /users, /ban <id>, /unban <id>.
 //
 // Access rule: if no ADMIN_USER_IDS, ALLOWED_USER_IDS and no Redis are configured, everyone is allowed.
@@ -115,6 +115,39 @@ function chunk(text, size = TG_MAX_MESSAGE) {
   }
   if (rest) parts.push(rest);
   return parts;
+}
+
+const HELP = [
+  'Что умею:',
+  '• Перешли голосовое, аудио или картинку с текстом — верну текст.',
+  '  Из WhatsApp: зажать сообщение → Переслать → Поделиться → Telegram → этот чат.',
+  '',
+  'Команды (ответом на сообщение бота: свайп влево или зажать → Ответить):',
+  '/tr <язык> — перевести. Например: /tr en, /tr ru, /tr Spanish',
+  '/sum — короткий пересказ без воды',
+  '',
+  '/join <кодовое слово> — получить доступ',
+  '/help — эта подсказка',
+].join('\n');
+
+const ADMIN_HELP = [
+  '',
+  'Админ:',
+  '/users — кто зарегистрирован',
+  '/ban <id> — удалить и заблокировать',
+  '/unban <id> — разблокировать',
+].join('\n');
+
+// Command menu shown by Telegram under the "/" button. Best effort, ignored on failure.
+function registerCommands() {
+  return tg('setMyCommands', {
+    commands: [
+      { command: 'help', description: 'Что умею и команды' },
+      { command: 'tr', description: 'Перевести (ответом на сообщение): /tr en' },
+      { command: 'sum', description: 'Короткий пересказ (ответом на сообщение)' },
+      { command: 'join', description: 'Получить доступ: /join кодовое слово' },
+    ],
+  }).catch(() => {});
 }
 
 function idList(name) {
@@ -308,8 +341,10 @@ async function handleMessage(msg) {
   const command = cmd ? cmd[1].toLowerCase() : '';
   const arg = cmd ? cmd[2] || '' : '';
 
-  if (command === 'start') {
-    await sendText(chatId, `Привет. Перешли сюда голосовое или картинку с текстом (из WhatsApp: зажать → Переслать → Поделиться → Telegram), я верну текст.\n\nЕсли у тебя есть кодовое слово: /join слово\nТвой Telegram id: ${userId}`);
+  if (command === 'start' || command === 'help') {
+    await registerCommands();
+    const extra = isAdmin(userId) ? ADMIN_HELP : '';
+    await sendText(chatId, `${HELP}${extra}\n\nТвой Telegram id: ${userId}`);
     return;
   }
   if (command === 'join') {

@@ -56,7 +56,7 @@ global.fetch = async (url, opts = {}) => {
     return json({ result: fakeRedis(JSON.parse(opts.body)) });
   }
   if (url.includes('/getFile')) return json({ ok: true, result: { file_path: 'documents/file_0.opus' } });
-  if (url.includes('/sendMessage') || url.includes('/sendChatAction')) return json({ ok: true, result: {} });
+  if (url.includes('/sendMessage') || url.includes('/sendChatAction') || url.includes('/setMyCommands')) return json({ ok: true, result: {} });
   if (url.includes('/file/bot')) return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
   if (url.includes('chat/completions')) {
     const body = JSON.parse(opts.body);
@@ -190,6 +190,13 @@ function mockRes() {
   out = await send({ id: 42 }, { photo: [{ file_id: 'small' }, { file_id: 'big' }] });
   assert.deepStrictEqual(out, ['🖼 Текст с картинки', '🌐 Hello, this is a test.']);
   delete process.env.TRANSLATE_TO;
+
+  // /help: admin sees admin section, others don't; command menu registered
+  out = await send({ id: 1 }, { text: '/help' });
+  assert.ok(out[0].includes('/tr <язык>') && out[0].includes('/ban <id>') && out[0].includes('id: 1'));
+  assert.ok(calls.some((c) => c.url.includes('/setMyCommands')));
+  out = await send(stranger, { text: '/start' });
+  assert.ok(out[0].includes('/join') && !out[0].includes('/ban'));
 
   // static allowlist still works without touching Redis
   out = await send({ id: 42 }, { voice: { file_id: 'v' } });
