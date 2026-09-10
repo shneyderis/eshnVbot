@@ -22,6 +22,9 @@ assert.ok(bot.pickFile({ voice: { file_id: 'v' } }));
 assert.ok(bot.pickFile({ document: { file_id: 'd', file_name: 'x.opus', mime_type: 'application/octet-stream' } }));
 assert.strictEqual(bot.pickFile({ document: { file_id: 'd', file_name: 'x.pdf', mime_type: 'application/pdf' } }), null);
 assert.strictEqual(bot.pickFile({ text: 'hi' }), null);
+assert.strictEqual(bot.pickImage({ photo: [{ file_id: 'small' }, { file_id: 'big' }] }).fileId, 'big');
+assert.ok(bot.pickImage({ document: { file_id: 'd', file_name: 'scan.png', mime_type: 'image/png' } }));
+assert.strictEqual(bot.pickImage({ document: { file_id: 'd', file_name: 'x.opus', mime_type: 'audio/ogg' } }), null);
 assert.ok(bot.isAdmin(1) && !bot.isAdmin(42));
 const long = 'слово '.repeat(2000).trim();
 const parts = bot.chunk(long);
@@ -58,6 +61,11 @@ global.fetch = async (url, opts = {}) => {
   if (url.includes('chat/completions')) {
     const body = JSON.parse(opts.body);
     if (body.messages[0].content.startsWith('Summarize')) return json({ choices: [{ message: { content: '- тест' } }] });
+    if (body.messages[0].content.startsWith('Extract all text')) {
+      const img = body.messages[1].content.find((c) => c.type === 'image_url');
+      assert.ok(img.image_url.url.startsWith('data:image/jpeg;base64,'));
+      return json({ choices: [{ message: { content: img.image_url.url.endsWith('AQID') ? 'Текст с картинки' : 'NO_TEXT' } }] });
+    }
     const target = /into (\w+)\./.exec(body.messages[0].content)[1];
     const content = target === 'Russian' ? '=' : 'Hello, this is a test.';
     return json({ choices: [{ message: { content } }] });
@@ -176,6 +184,12 @@ function mockRes() {
   assert.deepStrictEqual(out, ['Доступ открыт. Присылай голосовые.']);
   out = await send({ id: 1 }, { text: '/ban abc' });
   assert.deepStrictEqual(out, ['Использование: /ban <id>']);
+
+  // photo: text is read from the image, then translated like a voice note
+  process.env.TRANSLATE_TO = 'English';
+  out = await send({ id: 42 }, { photo: [{ file_id: 'small' }, { file_id: 'big' }] });
+  assert.deepStrictEqual(out, ['🖼 Текст с картинки', '🌐 Hello, this is a test.']);
+  delete process.env.TRANSLATE_TO;
 
   // static allowlist still works without touching Redis
   out = await send({ id: 42 }, { voice: { file_id: 'v' } });

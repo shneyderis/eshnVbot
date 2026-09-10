@@ -13,7 +13,7 @@
 //   TRANSCRIBE_LANGUAGE      optional ISO-639-1 hint ("ru", "uk", "en"); default: auto-detect
 //   TRANSLATE_TO             optional target language ("ru", "Russian", "en"...); when set, every
 //                            transcript is followed by a translation (skipped if already in that language)
-//   TRANSLATE_MODEL          default "gpt-4o-mini" (also used for summaries)
+//   TRANSLATE_MODEL          default "gpt-4o-mini" (also used for summaries and reading text from images)
 //   SUMMARY                  "1" to follow every transcript with a short summary
 //   SUMMARY_MIN_CHARS        only summarize transcripts longer than this (default 300)
 //
@@ -53,6 +53,25 @@ function sendText(chatId, text, replyTo) {
     text,
     reply_parameters: replyTo ? { message_id: replyTo, allow_sending_without_reply: true } : undefined,
   });
+}
+
+const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif']);
+const NO_TEXT = 'NO_TEXT';
+
+// Pick the image attachment from a Telegram message, if any (largest photo size).
+function pickImage(msg) {
+  if (msg.photo && msg.photo.length) {
+    const best = msg.photo[msg.photo.length - 1];
+    return { fileId: best.file_id, mime: 'image/jpeg' };
+  }
+  if (msg.document) {
+    const d = msg.document;
+    const mime = d.mime_type || '';
+    if (mime.startsWith('image/') || IMAGE_EXTS.has(extOf(d.file_name || ''))) {
+      return { fileId: d.file_id, mime: mime || 'image/jpeg' };
+    }
+  }
+  return null;
 }
 
 // Pick the audio-bearing attachment from a Telegram message, if any.
@@ -189,6 +208,7 @@ async function transcribe(buffer, filename) {
   return (await r.text()).trim();
 }
 
+// `user` is a string or an array of OpenAI content parts (text / image_url).
 async function chat(system, user) {
   const r = await fetch(OPENAI_CHAT_API, {
     method: 'POST',
@@ -225,6 +245,18 @@ function summarize(text, lang) {
   );
 }
 
+// Text from an image, or '' if there is none.
+async function readImage(buffer, mime) {
+  const out = await chat(
+    `Extract all text from the image exactly as written, in reading order, keeping line breaks. Output only the text, no comments or formatting. If the image contains no readable text, reply with exactly: ${NO_TEXT}`,
+    [
+      { type: 'text', text: 'Read the text in this image.' },
+      { type: 'image_url', image_url: { url: `data:${mime};base64,${buffer.toString('base64')}` } },
+    ],
+  );
+  return out === NO_TEXT ? '' : out;
+}
+
 function summaryEnabled() {
   return /^(1|true|yes|on)$/i.test((process.env.SUMMARY || '').trim());
 }
@@ -235,7 +267,24 @@ function summaryMinChars() {
 }
 
 function stripPrefix(text) {
-  return text.replace(/^[🎤🌐📝]\s*/u, '');
+  return text.replace(/^[🎤🖼🌐📝]\s*/u, '');
+}
+
+async function downloadTelegramFile(fileId) {
+  const info = await tg('getFile', { file_id: fileId });
+  const url = `${TG_API}/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${info.file_path}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`download failed: ${r.status}`);
+  return { buffer: Buffer.from(await r.arrayBuffer()), path: info.file_path };
+}
+
+// Send the recognized text, then translation and summary if configured.
+async function deliver(chatId, text, replyTo, icon) {
+  const target = (process.env.TRANSLATE_TO || '').trim();
+  const withSummary = summaryEnabled() && text.length > summaryMinChars();
+  await sendLong(chatId, target || withSummary ? `${icon} ${text}` : text, replyTo);
+  if (target) await replyWithTranslation(chatId, text, target, replyTo);
+  if (withSummary) await sendLong(chatId, `📝 ${await summarize(text, target)}`, replyTo);
 }
 
 async function sendLong(chatId, text, replyTo) {
@@ -260,7 +309,7 @@ async function handleMessage(msg) {
   const arg = cmd ? cmd[2] || '' : '';
 
   if (command === 'start') {
-    await sendText(chatId, `Привет. Перешли сюда голосовое (из WhatsApp: зажать → Переслать → Поделиться → Telegram), я верну текст.\n\nЕсли у тебя есть кодовое слово: /join слово\nТвой Telegram id: ${userId}`);
+    await sendText(chatId, `Привет. Перешли сюда голосовое или картинку с текстом (из WhatsApp: зажать → Переслать → Поделиться → Telegram), я верну текст.\n\nЕсли у тебя есть кодовое слово: /join слово\nТвой Telegram id: ${userId}`);
     return;
   }
   if (command === 'join') {
@@ -305,30 +354,33 @@ async function handleMessage(msg) {
     return;
   }
 
+  const image = pickImage(msg);
+  if (image) {
+    await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+    const { buffer } = await downloadTelegramFile(image.fileId);
+    const text = await readImage(buffer, image.mime);
+    if (!text) {
+      await sendText(chatId, 'Текста на картинке не нашёл.', msg.message_id);
+      return;
+    }
+    await deliver(chatId, text, msg.message_id, '🖼');
+    return;
+  }
+
   const file = pickFile(msg);
   if (!file) {
-    if (msg.text) await sendText(chatId, 'Пришли голосовое или аудиофайл.');
+    if (msg.text) await sendText(chatId, 'Пришли голосовое, аудиофайл или картинку с текстом.');
     return;
   }
 
   await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
-
-  const info = await tg('getFile', { file_id: file.fileId });
-  const url = `${TG_API}/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${info.file_path}`;
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`download failed: ${r.status}`);
-  const buffer = Buffer.from(await r.arrayBuffer());
-
-  const text = await transcribe(buffer, uploadName(file.name, info.file_path));
+  const { buffer, path } = await downloadTelegramFile(file.fileId);
+  const text = await transcribe(buffer, uploadName(file.name, path));
   if (!text) {
     await sendText(chatId, 'Не удалось распознать речь.', msg.message_id);
     return;
   }
-  const target = (process.env.TRANSLATE_TO || '').trim();
-  const withSummary = summaryEnabled() && text.length > summaryMinChars();
-  await sendLong(chatId, target || withSummary ? `🎤 ${text}` : text, msg.message_id);
-  if (target) await replyWithTranslation(chatId, text, target, msg.message_id);
-  if (withSummary) await sendLong(chatId, `📝 ${await summarize(text, target)}`, msg.message_id);
+  await deliver(chatId, text, msg.message_id, '🎤');
 }
 
 async function handler(req, res) {
@@ -355,6 +407,7 @@ async function handler(req, res) {
 
 module.exports = handler;
 module.exports.pickFile = pickFile;
+module.exports.pickImage = pickImage;
 module.exports.uploadName = uploadName;
 module.exports.chunk = chunk;
 module.exports.isAllowed = isAllowed;
