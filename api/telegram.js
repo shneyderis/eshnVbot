@@ -28,7 +28,37 @@ const store = require('../lib/store');
 const TG_API = 'https://api.telegram.org';
 const OPENAI_API = 'https://api.openai.com/v1/audio/transcriptions';
 const OPENAI_CHAT_API = 'https://api.openai.com/v1/chat/completions';
-const SAME_LANGUAGE = '=';
+// Short codes and Russian names -> full English language names (models handle those reliably).
+const LANG_NAMES = {
+  ru: 'Russian', рус: 'Russian', русский: 'Russian',
+  en: 'English', англ: 'English', английский: 'English',
+  uk: 'Ukrainian', ua: 'Ukrainian', укр: 'Ukrainian', украинский: 'Ukrainian', українська: 'Ukrainian',
+  he: 'Hebrew', iw: 'Hebrew', иврит: 'Hebrew',
+  de: 'German', немецкий: 'German',
+  fr: 'French', французский: 'French',
+  es: 'Spanish', испанский: 'Spanish',
+  it: 'Italian', итальянский: 'Italian',
+  pt: 'Portuguese', португальский: 'Portuguese',
+  pl: 'Polish', польский: 'Polish',
+  tr: 'Turkish', турецкий: 'Turkish',
+  ar: 'Arabic', арабский: 'Arabic',
+  zh: 'Chinese', китайский: 'Chinese',
+  ja: 'Japanese', японский: 'Japanese',
+  ko: 'Korean', корейский: 'Korean',
+  ka: 'Georgian', грузинский: 'Georgian',
+  hy: 'Armenian', армянский: 'Armenian',
+  kk: 'Kazakh', казахский: 'Kazakh',
+  ro: 'Romanian', румынский: 'Romanian', md: 'Romanian', молдавский: 'Romanian',
+  nl: 'Dutch', голландский: 'Dutch',
+  cs: 'Czech', чешский: 'Czech',
+  el: 'Greek', греческий: 'Greek',
+  hi: 'Hindi', хинди: 'Hindi',
+};
+
+function langName(input) {
+  const key = String(input || '').trim().toLowerCase().replace(/\.$/, '');
+  return LANG_NAMES[key] || String(input).trim();
+}
 const TG_MAX_MESSAGE = 4096;
 // Extensions accepted by the OpenAI transcription endpoint.
 const OPENAI_EXTS = new Set(['flac', 'm4a', 'mp3', 'mp4', 'mpeg', 'mpga', 'oga', 'ogg', 'wav', 'webm']);
@@ -242,7 +272,7 @@ async function transcribe(buffer, filename) {
 }
 
 // `user` is a string or an array of OpenAI content parts (text / image_url).
-async function chat(system, user) {
+async function chat(system, user, extra = {}) {
   const r = await fetch(OPENAI_CHAT_API, {
     method: 'POST',
     headers: { authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'content-type': 'application/json' },
@@ -250,6 +280,7 @@ async function chat(system, user) {
       model: process.env.TRANSLATE_MODEL || 'gpt-4o-mini',
       temperature: 0,
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      ...extra,
     }),
   });
   if (!r.ok) {
@@ -261,17 +292,22 @@ async function chat(system, user) {
 }
 
 // Returns the translation, or '' if the text is already in the target language.
-async function translate(text, target) {
+async function translate(text, targetInput) {
+  const target = langName(targetInput);
   const out = await chat(
-    `You translate transcribed speech into ${target}. Reply with the translation only, no comments. Keep the meaning and tone; fix obvious transcription slips. If the text is already entirely in ${target}, reply with exactly: ${SAME_LANGUAGE}`,
+    `You are a translator. Target language: ${target}. Respond with a JSON object: {"source_language": "<language of the text, in English>", "already_target": <true only if the whole text is already written in ${target}>, "translation": "<the text translated into ${target}, keeping meaning and tone and fixing obvious transcription slips; empty string if already_target is true>"}`,
     text,
+    { response_format: { type: 'json_object' } },
   );
-  return out === SAME_LANGUAGE ? '' : out;
+  let data;
+  try { data = JSON.parse(out); } catch (_) { return out; }
+  if (data.already_target === true) return '';
+  return String(data.translation || '').trim();
 }
 
 // Short, no-filler summary. Written in `lang` if given, otherwise in the language of the text.
 function summarize(text, lang) {
-  const language = lang ? `Write in ${lang}.` : 'Write in the same language as the text.';
+  const language = lang ? `Write in ${langName(lang)}.` : 'Write in the same language as the text.';
   return chat(
     `Summarize this transcribed voice message. Be brief and concrete: keep only facts, requests, decisions, dates, amounts, names. Drop greetings, filler and repetition. Use short bullet points ("- ") if there are several items, otherwise one or two sentences. No preamble. ${language}`,
     text,
@@ -447,3 +483,4 @@ module.exports.uploadName = uploadName;
 module.exports.chunk = chunk;
 module.exports.isAllowed = isAllowed;
 module.exports.isAdmin = isAdmin;
+module.exports.langName = langName;

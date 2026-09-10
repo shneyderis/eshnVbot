@@ -26,6 +26,9 @@ assert.strictEqual(bot.pickImage({ photo: [{ file_id: 'small' }, { file_id: 'big
 assert.ok(bot.pickImage({ document: { file_id: 'd', file_name: 'scan.png', mime_type: 'image/png' } }));
 assert.strictEqual(bot.pickImage({ document: { file_id: 'd', file_name: 'x.opus', mime_type: 'audio/ogg' } }), null);
 assert.ok(bot.isAdmin(1) && !bot.isAdmin(42));
+assert.strictEqual(bot.langName('ru'), 'Russian');
+assert.strictEqual(bot.langName(' Иврит '), 'Hebrew');
+assert.strictEqual(bot.langName('Spanish'), 'Spanish');
 const long = 'слово '.repeat(2000).trim();
 const parts = bot.chunk(long);
 assert.ok(parts.length > 1 && parts.every((p) => p.length <= 4096));
@@ -66,8 +69,11 @@ global.fetch = async (url, opts = {}) => {
       assert.ok(img.image_url.url.startsWith('data:image/jpeg;base64,'));
       return json({ choices: [{ message: { content: img.image_url.url.endsWith('AQID') ? 'Текст с картинки' : 'NO_TEXT' } }] });
     }
-    const target = /into (\w+)\./.exec(body.messages[0].content)[1];
-    const content = target === 'Russian' ? '=' : 'Hello, this is a test.';
+    assert.deepStrictEqual(body.response_format, { type: 'json_object' });
+    const target = /Target language: (\w+)\./.exec(body.messages[0].content)[1];
+    const content = target === 'Russian'
+      ? JSON.stringify({ source_language: 'Russian', already_target: true, translation: '' })
+      : JSON.stringify({ source_language: 'Russian', already_target: false, translation: 'Hello, this is a test.' });
     return json({ choices: [{ message: { content } }] });
   }
   if (url.includes('openai.com')) {
@@ -112,7 +118,7 @@ function mockRes() {
   assert.deepStrictEqual(msgs, ['🎤 Привет, это тест.', '🌐 Hello, this is a test.']);
 
   // already in target language: no translation message
-  process.env.TRANSLATE_TO = 'Russian';
+  process.env.TRANSLATE_TO = 'ru';
   calls.length = 0;
   await bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' }, body: update }, mockRes());
   msgs = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text);
@@ -122,7 +128,7 @@ function mockRes() {
   // /tr as a reply
   calls.length = 0;
   await bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' },
-    body: { message: { message_id: 3, chat: { id: 42 }, from: { id: 42 }, text: '/tr English',
+    body: { message: { message_id: 3, chat: { id: 42 }, from: { id: 42 }, text: '/tr en',
       reply_to_message: { message_id: 2, text: '🎤 Привет, это тест.' } } } }, mockRes());
   msgs = calls.filter((c) => c.url.includes('/sendMessage')).map((c) => JSON.parse(c.opts.body).text);
   assert.deepStrictEqual(msgs, ['Hello, this is a test.']);
