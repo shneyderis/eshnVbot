@@ -109,6 +109,7 @@ function pickFile(msg) {
   if (msg.voice) return { fileId: msg.voice.file_id, name: 'voice.ogg', mime: msg.voice.mime_type };
   if (msg.audio) return { fileId: msg.audio.file_id, name: msg.audio.file_name || 'audio.mp3', mime: msg.audio.mime_type };
   if (msg.video_note) return { fileId: msg.video_note.file_id, name: 'note.mp4', mime: 'video/mp4' };
+  if (msg.video) return { fileId: msg.video.file_id, name: msg.video.file_name || 'video.mp4', mime: msg.video.mime_type || 'video/mp4' };
   if (msg.document) {
     const d = msg.document;
     const mime = d.mime_type || '';
@@ -149,7 +150,8 @@ function chunk(text, size = TG_MAX_MESSAGE) {
 
 const HELP = [
   'Что умею:',
-  '• Перешли голосовое, аудио или картинку с текстом — верну текст.',
+  '• Перешли голосовое, аудио, видео или картинку с текстом — верну текст.',
+  '  Из видео распознаётся речь, не надписи на экране.',
   '  Из WhatsApp: зажать сообщение → Переслать → Поделиться → Telegram → этот чат.',
   '',
   'Команды (ответом на сообщение бота: свайп влево или зажать → Ответить):',
@@ -440,7 +442,12 @@ async function handleMessage(msg) {
 
   const file = pickFile(msg);
   if (!file) {
-    if (msg.text) await sendText(chatId, 'Пришли голосовое, аудиофайл или картинку с текстом.');
+    if (msg.text) await sendText(chatId, 'Пришли голосовое, аудиофайл, видео или картинку с текстом.');
+    return;
+  }
+  const size = (msg.video || msg.video_note || msg.audio || msg.document || msg.voice || {}).file_size || 0;
+  if (size > 20 * 1024 * 1024) {
+    await sendText(chatId, 'Файл больше 20 МБ, Telegram не даёт ботам такие скачивать. Обрежь или сожми.', msg.message_id);
     return;
   }
 

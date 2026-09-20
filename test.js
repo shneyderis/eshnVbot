@@ -19,6 +19,7 @@ assert.strictEqual(bot.uploadName('a.m4a'), 'audio.m4a');
 assert.strictEqual(bot.uploadName('noext', 'voice/file_1.oga'), 'audio.oga');
 assert.strictEqual(bot.uploadName('weird.xyz'), 'audio.ogg');
 assert.ok(bot.pickFile({ voice: { file_id: 'v' } }));
+assert.strictEqual(bot.uploadName(bot.pickFile({ video: { file_id: 'x', mime_type: 'video/mp4' } }).name), 'audio.mp4');
 assert.ok(bot.pickFile({ document: { file_id: 'd', file_name: 'x.opus', mime_type: 'application/octet-stream' } }));
 assert.strictEqual(bot.pickFile({ document: { file_id: 'd', file_name: 'x.pdf', mime_type: 'application/pdf' } }), null);
 assert.strictEqual(bot.pickFile({ text: 'hi' }), null);
@@ -203,6 +204,11 @@ function mockRes() {
   assert.ok(calls.some((c) => c.url.includes('/setMyCommands')));
   out = await send(stranger, { text: '/start' });
   assert.ok(out[0].includes('/join') && !out[0].includes('/ban'));
+
+  // oversized file is rejected before download
+  out = await send({ id: 42 }, { video: { file_id: 'x', file_size: 30 * 1024 * 1024 } });
+  assert.ok(out[0].startsWith('Файл больше 20 МБ'));
+  assert.ok(!calls.some((c) => c.url.includes('/getFile')));
 
   // static allowlist still works without touching Redis
   out = await send({ id: 42 }, { voice: { file_id: 'v' } });
