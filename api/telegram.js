@@ -18,7 +18,8 @@
 //   SUMMARY_MIN_CHARS        only summarize transcripts longer than this (default 300)
 //
 // Commands: /start, /help, /join <word>; as a reply to a bot message: /tr <lang> translates it, /sum summarizes it.
-// Admin: /users, /ban <id>, /unban <id>, /call <brief> (outbound phone call by an AI agent, see lib/calls.js).
+// Admin: /users, /ban <id>, /unban <id>, /call <brief> (outbound phone call by an AI agent, see lib/calls.js),
+// /contacts, /forget <name> (phone numbers remembered by /call).
 //
 // Access rule: if no ADMIN_USER_IDS, ALLOWED_USER_IDS and no Redis are configured, everyone is allowed.
 // Otherwise a user must be an admin, in ALLOWED_USER_IDS, or registered via /join (and not banned).
@@ -169,8 +170,11 @@ const ADMIN_HELP = [
   '/users — кто зарегистрирован',
   '/ban <id> — удалить и заблокировать',
   '/unban <id> — разблокировать',
-  '/call <номер и задание> — позвонить за меня. Можно ответом на расшифрованное голосовое.',
-  '  Например: /call +34931234567 запиши меня к терапевту на следующую неделю, утром',
+  '/call <задание> — позвонить за меня. Можно ответом на расшифрованное голосовое.',
+  '  С номером: /call +34931234567 запиши меня к терапевту на следующую неделю, утром',
+  '  По названию: /call позвони в ресторан Disfrutar в Барселоне, стол на двоих в пятницу в 21:00',
+  '/contacts — номера, которые бот запомнил',
+  '/forget <название> — забыть номер',
 ].join('\n');
 
 // Command menu shown by Telegram under the "/" button. Best effort, ignored on failure.
@@ -259,8 +263,9 @@ async function handleAdmin(msg, cmd, arg) {
 }
 
 const CALL_USAGE = [
-  'Напиши номер и задание:',
+  'Напиши задание с номером или названием места:',
   '/call +34931234567 запиши меня к терапевту на следующую неделю, утром',
+  '/call позвони в ресторан Disfrutar в Барселоне, стол на двоих в пятницу в 21:00',
   '',
   'Или ответь командой /call на сообщение с заданием (например, на расшифрованное голосовое).',
 ].join('\n');
@@ -280,9 +285,10 @@ async function handleCall(msg, arg) {
     return;
   }
   await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
-  const plan = await calls.planCall(chat, brief);
+  const plan = await calls.resolveNumber(await calls.planCall(chat, brief), brief);
   if (!plan.number) {
-    await sendText(chatId, 'Не нашёл номер. Укажи его в международном формате, например +34931234567.', msg.message_id);
+    const what = plan.placeName ? `Не нашёл номер для «${plan.placeName}».` : 'Не нашёл номер.';
+    await sendText(chatId, `${what} Укажи его в международном формате, например +34931234567.`, msg.message_id);
     return;
   }
   if (!plan.task) {
@@ -329,12 +335,34 @@ async function handleCallback(query) {
   }
   await answer('Звоню…');
   try {
+    await calls.rememberPlace(saved.plan);
     await calls.startCall(saved.plan, { chatId: saved.chatId, replyTo: saved.replyTo });
     await finish('Звоню. Итог и расшифровку пришлю сюда.');
   } catch (e) {
     console.error('startCall failed', e);
     await finish(`Не удалось начать звонок: ${e.message}`);
   }
+}
+
+// "/contacts" and "/forget <name>": the numbers /call has remembered.
+async function handleContacts(msg, command, arg) {
+  const chatId = msg.chat.id;
+  if (!store.isConfigured()) {
+    await sendText(chatId, 'Хранилище не настроено.');
+    return;
+  }
+  if (command === 'contacts') {
+    const list = await calls.listContacts();
+    const lines = list.map((c) => `${c.name} — ${c.number}${c.address ? ` — ${c.address}` : ''}`);
+    await sendLong(chatId, list.length ? `Номера (${list.length}):\n${lines.join('\n')}` : 'Пока ничего не запомнил.');
+    return;
+  }
+  if (!arg.trim()) {
+    await sendText(chatId, 'Использование: /forget <название>');
+    return;
+  }
+  const removed = await calls.forgetContact(arg);
+  await sendText(chatId, removed ? `Забыл: ${removed.name} — ${removed.number}.` : `Не нашёл «${arg.trim()}» в базе.`);
 }
 
 async function transcribe(buffer, filename) {
@@ -479,13 +507,14 @@ async function handleMessage(msg) {
     await handleAdmin(msg, command, arg);
     return;
   }
-  if (command === 'call') {
+  if (['call', 'contacts', 'forget'].includes(command)) {
     // Admin only: calls cost money and go out from the owner's phone number.
     if (!isAdmin(userId)) {
       await sendText(chatId, 'Только для админа.');
       return;
     }
-    await handleCall(msg, arg);
+    if (command === 'call') await handleCall(msg, arg);
+    else await handleContacts(msg, command, arg);
     return;
   }
   if (!(await isAllowed(userId))) {

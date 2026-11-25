@@ -67,11 +67,13 @@ assert.strictEqual(
 
 // --- end-to-end with mocked network ---
 const calls = [];
+let dialed = 0;
 // in-memory fake of the two Redis structures the bot uses
-const redisUsers = {};
+const redisHashes = { users: {}, contacts: {} };
 const redisBanned = new Set();
 const redisKV = {}; // plain keys used by /call
 function fakeRedis([cmd, key, ...args]) {
+  const redisUsers = redisHashes[key] || {};
   switch (cmd) {
     case 'SET':
       if (args.includes('NX') && key in redisKV) return null;
@@ -100,9 +102,19 @@ global.fetch = async (url, opts = {}) => {
   if (url.includes('/getFile')) return json({ ok: true, result: { file_path: 'documents/file_0.opus' } });
   if (url.includes('/sendMessage') || url.includes('/sendChatAction') || url.includes('/setMyCommands')) return json({ ok: true, result: {} });
   if (url.includes('/answerCallbackQuery') || url.includes('/editMessageText')) return json({ ok: true, result: {} });
+  if (url === 'https://api.openai.com/v1/responses') {
+    const body = JSON.parse(opts.body);
+    assert.deepStrictEqual(body.tools, [{ type: 'web_search' }]);
+    assert.ok(body.input.includes('Place: Disfrutar') && body.input.includes('Location: Barcelona'));
+    return json({ output: [
+      { type: 'web_search_call', status: 'completed' },
+      { type: 'message', content: [{ type: 'output_text', text: 'Here it is:\n{"name":"Disfrutar","phone":"+34 933 48 68 96","address":"C/ de Villarroel 163, Barcelona","source_url":"https://example.com/disfrutar"}' }] },
+    ] });
+  }
   if (url.includes('elevenlabs.io')) {
     assert.strictEqual(opts.headers['xi-api-key'], 'EL');
-    return json({ success: true, message: 'ok', conversation_id: 'conv_1', sip_call_id: 'sip_1' });
+    dialed += 1; // each started call gets its own conversation id, like the real API
+    return json({ success: true, message: 'ok', conversation_id: `conv_${dialed}`, sip_call_id: `sip_${dialed}` });
   }
   if (url.includes('/file/bot')) return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
   if (url.includes('chat/completions')) {
@@ -120,7 +132,9 @@ global.fetch = async (url, opts = {}) => {
     assert.deepStrictEqual(body.response_format, { type: 'json_object' });
     if (body.messages[0].content.startsWith('You prepare a phone call')) {
       const noNumber = !/\d{3}/.test(body.messages[1].content);
+      const byName = body.messages[1].content.includes('Disfrutar');
       return json({ choices: [{ message: { content: JSON.stringify({
+        place_name: byName ? 'Disfrutar' : '', place_location: byName ? 'Barcelona' : '',
         to_number: noNumber ? '' : '+34 931 234 567', language: 'es', language_name_ru: 'испанский', language_name_en: 'Spanish',
         callee_ru: 'клиника', goal_ru: 'Записаться к терапевту на завтра утром.',
         first_message: 'Hola, soy un asistente de IA y llamo de parte de Eugene.',
@@ -292,7 +306,7 @@ function mockRes() {
   process.env.CALL_ON_BEHALF_OF = 'Eugene';
 
   out = await send({ id: 1 }, { text: '/call' });
-  assert.ok(out[0].startsWith('Напиши номер и задание'));
+  assert.ok(out[0].startsWith('Напиши задание с номером или названием места'));
   out = await send({ id: 1 }, { text: '/call запиши меня к терапевту' });
   assert.ok(out[0].startsWith('Не нашёл номер'));
 
@@ -321,7 +335,8 @@ function mockRes() {
   assert.strictEqual(dialBody.to_number, '+34931234567');
   const override = dialBody.conversation_initiation_client_data.conversation_config_override.agent;
   assert.strictEqual(override.language, 'es');
-  assert.strictEqual(override.first_message, 'Hola, soy un asistente de IA y llamo de parte de Eugene.');
+  assert.ok(!('first_message' in override)); // not available on every ElevenLabs plan: the opening is in the prompt
+  assert.ok(override.prompt.prompt.includes('Hola, soy un asistente de IA y llamo de parte de Eugene.'));
   assert.ok(override.prompt.prompt.includes('Book a GP appointment') && override.prompt.prompt.includes('on behalf of Eugene'));
   assert.ok(override.prompt.prompt.includes('Never give or take payment card details'));
   assert.strictEqual(dialBody.conversation_initiation_client_data.dynamic_variables.tg_chat_id, '1');
@@ -341,6 +356,37 @@ function mockRes() {
   // /call as a reply to a transcribed voice note takes the brief from that message
   out = await send({ id: 1 }, { text: '/call', reply_to_message: { message_id: 5, text: '🎤 Позвони в клинику +34 931 234 567 и запиши меня' } });
   assert.ok(out[0].includes('Номер: +34931234567'));
+
+  // ---------- /call by name ----------
+  const usedWebSearch = () => calls.some((c) => c.url === 'https://api.openai.com/v1/responses');
+  out = await send({ id: 1 }, { text: '/call позвони в ресторан Disfrutar в Барселоне, стол на двоих' });
+  assert.ok(usedWebSearch());
+  assert.ok(out[0].includes('Номер: +34933486896') && out[0].includes('Номер найден в интернете, проверь: Disfrutar, C/ de Villarroel 163, Barcelona'));
+  assert.ok(out[0].includes('Источник: https://example.com/disfrutar'));
+  assert.deepStrictEqual(redisHashes.contacts, {}); // nothing is remembered before the call is confirmed
+
+  // confirmed: dials through Twilio when configured so, and remembers the number
+  process.env.ELEVENLABS_TELEPHONY = 'twilio';
+  await press({ id: 1 }, tgCalls('sendMessage')[0].reply_markup.inline_keyboard[0][0].callback_data, out[0]);
+  const byName = calls.filter((c) => c.url.includes('elevenlabs.io'));
+  assert.strictEqual(byName[0].url, 'https://api.elevenlabs.io/v1/convai/twilio/outbound-call');
+  assert.strictEqual(JSON.parse(byName[0].opts.body).to_number, '+34933486896');
+  delete process.env.ELEVENLABS_TELEPHONY;
+  assert.strictEqual(JSON.parse(redisHashes.contacts.disfrutar).number, '+34933486896');
+
+  // next time the number comes from the saved contacts, without a web search
+  out = await send({ id: 1 }, { text: '/call позвони в Disfrutar, перенеси бронь' });
+  assert.ok(!usedWebSearch());
+  assert.ok(out[0].includes('Номер: +34933486896 (из базы: Disfrutar)'));
+
+  out = await send({ id: 1 }, { text: '/contacts' });
+  assert.deepStrictEqual(out, ['Номера (1):\nDisfrutar — +34933486896 — C/ de Villarroel 163, Barcelona']);
+  out = await send({ id: 42 }, { text: '/contacts' });
+  assert.deepStrictEqual(out, ['Только для админа.']);
+  out = await send({ id: 1 }, { text: '/forget disfrutar' });
+  assert.deepStrictEqual(out, ['Забыл: Disfrutar — +34933486896.']);
+  out = await send({ id: 1 }, { text: '/contacts' });
+  assert.deepStrictEqual(out, ['Пока ничего не запомнил.']);
 
   // ---------- result webhook ----------
   const { Readable } = require('node:stream');
@@ -380,7 +426,7 @@ function mockRes() {
   assert.deepStrictEqual(hooked.texts, []);
 
   // nobody spoke: no model call, plain note
-  hooked = await hook({ ...done, data: { ...done.data, conversation_id: 'conv_2', transcript: [done.data.transcript[0]] } });
+  hooked = await hook({ ...done, data: { ...done.data, conversation_id: 'conv_unknown', transcript: [done.data.transcript[0]] } });
   assert.ok(hooked.texts[0].includes('Собеседника не было слышно'));
   assert.ok(!calls.some((c) => c.url.includes('chat/completions')));
   assert.strictEqual(tgCalls('sendMessage')[0].chat_id, '1'); // unknown call: falls back to the echoed chat id
