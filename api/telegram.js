@@ -170,7 +170,7 @@ const ADMIN_HELP = [
   '/users — кто зарегистрирован',
   '/ban <id> — удалить и заблокировать',
   '/unban <id> — разблокировать',
-  '/call <задание> — позвонить за меня. Или голосовым, которое начинается со слова «позвони».',
+  '/call <задание> — позвонить за меня. Можно без команды: текстом или голосовым, которое начинается со слова «позвони».',
   '  С номером: /call +34931234567 запиши меня к терапевту на следующую неделю, утром',
   '  По названию: /call позвони в ресторан Disfrutar в Барселоне, стол на двоих в пятницу в 21:00',
   '/contacts — номера, которые бот запомнил',
@@ -282,7 +282,7 @@ const CALL_USAGE = [
   '/call +34931234567 запиши меня к терапевту на следующую неделю, утром',
   '/call позвони в ресторан Disfrutar в Барселоне, стол на двоих в пятницу в 21:00',
   '',
-  'Или наговори голосовое, которое начинается со слова «позвони».',
+  'Или без команды: напиши или наговори сообщение, которое начинается со слова «позвони».',
   'Или ответь командой /call на сообщение с заданием.',
 ].join('\n');
 
@@ -518,11 +518,20 @@ async function replyWithTranslation(chatId, text, target, replyTo) {
   if (translated) await sendLong(chatId, `🌐 ${translated}`, replyTo);
 }
 
+// Pasted text can start with characters nobody sees (zero-width space, direction marks) or use a
+// look-alike slash; then "/call ..." would not be recognised as a command. Normalise the start.
+function cleanCommandText(text) {
+  return String(text || '')
+    .replace(/^[\s\p{Cf}]+/u, '')
+    .replace(/^[\u2044\u2215\uFF0F\u29F8]/, '/')
+    .trim();
+}
+
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
   const userId = msg.from && msg.from.id;
 
-  const incoming = (msg.text || '').trim();
+  const incoming = cleanCommandText(msg.text);
   const cmd = /^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(incoming);
   const command = cmd ? cmd[1].toLowerCase() : '';
   const arg = cmd ? cmd[2] || '' : '';
@@ -600,7 +609,18 @@ async function handleMessage(msg) {
 
   const file = pickFile(msg);
   if (!file) {
-    if (msg.text) await sendText(chatId, 'Пришли голосовое, аудиофайл, видео или картинку с текстом.');
+    if (!msg.text) return;
+    // The admin can also just write "позвони в ..." without /call, the same way as by voice.
+    if (isAdmin(userId) && !msg.forward_origin && !msg.forward_date
+      && CALL_TRIGGER.test(incoming) && !calls.missingConfig().length) {
+      await handleCall(msg, incoming);
+      return;
+    }
+    // First code points only: enough to see why a command was not recognised, without logging the message.
+    if (incoming.includes('/')) {
+      console.log('unrecognised text starts with', [...String(msg.text).slice(0, 8)].map((c) => c.codePointAt(0).toString(16)).join(' '));
+    }
+    await sendText(chatId, 'Пришли голосовое, аудиофайл, видео или картинку с текстом.');
     return;
   }
   const size = (msg.video || msg.video_note || msg.audio || msg.document || msg.voice || {}).file_size || 0;
@@ -666,3 +686,4 @@ module.exports.sendText = sendText;
 module.exports.sendLong = sendLong;
 module.exports.idList = idList;
 module.exports.isCallBrief = isCallBrief;
+module.exports.cleanCommandText = cleanCommandText;
