@@ -11,6 +11,8 @@ process.env.KV_REST_API_URL = 'https://redis.example';
 process.env.KV_REST_API_TOKEN = 'R';
 
 const bot = require('./api/telegram.js');
+const callResult = require('./api/call-result.js');
+const callsLib = require('./lib/calls.js');
 
 // --- unit helpers ---
 assert.strictEqual(bot.uploadName('PTT-20250903-WA0001.opus'), 'audio.ogg');
@@ -35,13 +37,49 @@ const parts = bot.chunk(long);
 assert.ok(parts.length > 1 && parts.every((p) => p.length <= 4096));
 assert.strictEqual(parts.join(' '), long);
 
+// --- outbound calls: unit helpers ---
+assert.strictEqual(callsLib.normalizeNumber('+81 (3) 1234-5678'), '+81312345678');
+assert.strictEqual(callsLib.normalizeNumber('0034 931 234 567'), '+34931234567');
+assert.strictEqual(callsLib.normalizeNumber('931234567'), ''); // no country code
+assert.strictEqual(callsLib.normalizeNumber('112'), '');
+assert.strictEqual(callsLib.leadingNumber('+34 931 234 567 запиши меня'), '+34931234567');
+assert.strictEqual(callsLib.leadingNumber('запиши меня, номер +34931234567'), '');
+{
+  const body = '{"type":"x"}';
+  const now = 1700000000;
+  const header = callsLib.sign(body, 'whsec', now);
+  assert.ok(callsLib.verifySignature(body, header, 'whsec', now));
+  assert.ok(!callsLib.verifySignature(body + ' ', header, 'whsec', now)); // body changed
+  assert.ok(!callsLib.verifySignature(body, header, 'other', now)); // wrong secret
+  assert.ok(!callsLib.verifySignature(body, header, 'whsec', now + 3600)); // too old
+  assert.ok(!callsLib.verifySignature(body, 't=1,v0=zz', 'whsec', now));
+  assert.ok(!callsLib.verifySignature(body, undefined, 'whsec', now));
+}
+assert.strictEqual(
+  callsLib.formatTranscript([{ role: 'agent', message: 'Hola' }, { role: 'user', message: ' Sí ' }, { role: 'agent', message: null }]),
+  'Бот: Hola\nСобеседник: Sí',
+);
+assert.ok(!callsLib.heardAnyone([{ role: 'agent', message: 'Hola' }]));
+assert.strictEqual(
+  callsLib.failureText({ failure_reason: 'busy', metadata: { type: 'sip', body: { sip_status_code: 486, sip_status: 'Busy here' } } }),
+  'занято (SIP 486 Busy here)',
+);
+
 // --- end-to-end with mocked network ---
 const calls = [];
 // in-memory fake of the two Redis structures the bot uses
 const redisUsers = {};
 const redisBanned = new Set();
+const redisKV = {}; // plain keys used by /call
 function fakeRedis([cmd, key, ...args]) {
   switch (cmd) {
+    case 'SET':
+      if (args.includes('NX') && key in redisKV) return null;
+      redisKV[key] = args[0];
+      return 'OK';
+    case 'GET': return key in redisKV ? redisKV[key] : null;
+    case 'GETDEL': { const v = key in redisKV ? redisKV[key] : null; delete redisKV[key]; return v; }
+    case 'DEL': delete redisKV[key]; return 1;
     case 'HEXISTS': return args[0] in redisUsers ? 1 : 0;
     case 'HSET': redisUsers[args[0]] = args[1]; return 1;
     case 'HDEL': delete redisUsers[args[0]]; return 1;
@@ -61,6 +99,11 @@ global.fetch = async (url, opts = {}) => {
   }
   if (url.includes('/getFile')) return json({ ok: true, result: { file_path: 'documents/file_0.opus' } });
   if (url.includes('/sendMessage') || url.includes('/sendChatAction') || url.includes('/setMyCommands')) return json({ ok: true, result: {} });
+  if (url.includes('/answerCallbackQuery') || url.includes('/editMessageText')) return json({ ok: true, result: {} });
+  if (url.includes('elevenlabs.io')) {
+    assert.strictEqual(opts.headers['xi-api-key'], 'EL');
+    return json({ success: true, message: 'ok', conversation_id: 'conv_1', sip_call_id: 'sip_1' });
+  }
   if (url.includes('/file/bot')) return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
   if (url.includes('chat/completions')) {
     const body = JSON.parse(opts.body);
@@ -70,7 +113,20 @@ global.fetch = async (url, opts = {}) => {
       assert.ok(img.image_url.url.startsWith('data:image/jpeg;base64,'));
       return json({ choices: [{ message: { content: img.image_url.url.endsWith('AQID') ? 'Текст с картинки' : 'NO_TEXT' } }] });
     }
+    if (body.messages[0].content.startsWith('Report on a phone call')) {
+      assert.ok(body.messages[1].content.includes('Собеседник: Sí, mañana a las 10.'));
+      return json({ choices: [{ message: { content: 'Итог: цель достигнута.\n- Запись на завтра, 10:00' } }] });
+    }
     assert.deepStrictEqual(body.response_format, { type: 'json_object' });
+    if (body.messages[0].content.startsWith('You prepare a phone call')) {
+      const noNumber = !/\d{3}/.test(body.messages[1].content);
+      return json({ choices: [{ message: { content: JSON.stringify({
+        to_number: noNumber ? '' : '+34 931 234 567', language: 'es', language_name_ru: 'испанский', language_name_en: 'Spanish',
+        callee_ru: 'клиника', goal_ru: 'Записаться к терапевту на завтра утром.',
+        first_message: 'Hola, soy un asistente de IA y llamo de parte de Eugene.',
+        task: 'Book a GP appointment for tomorrow morning.', missing_ru: ['дата рождения'],
+      }) } }] });
+    }
     const target = /Target language: (\w+)\./.exec(body.messages[0].content)[1];
     const content = target === 'Russian'
       ? JSON.stringify({ source_language: 'Russian', already_target: true, translation: '' })
@@ -213,6 +269,135 @@ function mockRes() {
   // static allowlist still works without touching Redis
   out = await send({ id: 42 }, { voice: { file_id: 'v' } });
   assert.strictEqual(out[0], 'Привет, это тест.');
+
+  // ---------- /call ----------
+  const tgCalls = (method) => calls.filter((c) => c.url.includes('/' + method)).map((c) => JSON.parse(c.opts.body));
+  const press = (from, data, text) => {
+    calls.length = 0;
+    return bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' },
+      body: { callback_query: { id: 'cb', from, data, message: { message_id: 77, chat: { id: from.id }, text } } } }, mockRes());
+  };
+
+  // only the admin may call
+  out = await send({ id: 42 }, { text: '/call +34931234567 запиши меня к терапевту' });
+  assert.deepStrictEqual(out, ['Только для админа.']);
+
+  // not configured yet
+  out = await send({ id: 1 }, { text: '/call +34931234567 запиши меня к терапевту' });
+  assert.ok(out[0].startsWith('Звонки не настроены') && out[0].includes('ELEVENLABS_API_KEY'));
+  process.env.ELEVENLABS_API_KEY = 'EL';
+  process.env.ELEVENLABS_AGENT_ID = 'agent_1';
+  process.env.ELEVENLABS_PHONE_NUMBER_ID = 'phnum_1';
+  process.env.ELEVENLABS_WEBHOOK_SECRET = 'whsec';
+  process.env.CALL_ON_BEHALF_OF = 'Eugene';
+
+  out = await send({ id: 1 }, { text: '/call' });
+  assert.ok(out[0].startsWith('Напиши номер и задание'));
+  out = await send({ id: 1 }, { text: '/call запиши меня к терапевту' });
+  assert.ok(out[0].startsWith('Не нашёл номер'));
+
+  // plan is shown with buttons; nothing is dialed before the tap
+  out = await send({ id: 1 }, { text: '/call +34931234567 запиши меня к терапевту завтра утром' });
+  assert.ok(out[0].includes('Номер: +34931234567') && out[0].includes('Язык: испанский') && out[0].includes('• дата рождения'));
+  assert.ok(!calls.some((c) => c.url.includes('elevenlabs.io')));
+  const buttons = tgCalls('sendMessage')[0].reply_markup.inline_keyboard[0];
+  assert.deepStrictEqual(buttons.map((b) => b.text), ['✅ Звонить', '❌ Отмена']);
+  const goData = buttons[0].callback_data;
+  assert.ok(/^call:go:[0-9a-f]{16}$/.test(goData));
+
+  // a non-admin cannot press the button
+  await press({ id: 42 }, goData, out[0]);
+  assert.ok(!calls.some((c) => c.url.includes('elevenlabs.io')));
+  assert.strictEqual(tgCalls('answerCallbackQuery')[0].text, 'Только для админа.');
+
+  // admin confirms: ElevenLabs is asked to dial with the plan
+  await press({ id: 1 }, goData, out[0]);
+  const dial = calls.filter((c) => c.url.includes('elevenlabs.io'));
+  assert.strictEqual(dial.length, 1);
+  assert.strictEqual(dial[0].url, 'https://api.elevenlabs.io/v1/convai/sip-trunk/outbound-call');
+  const dialBody = JSON.parse(dial[0].opts.body);
+  assert.strictEqual(dialBody.agent_id, 'agent_1');
+  assert.strictEqual(dialBody.agent_phone_number_id, 'phnum_1');
+  assert.strictEqual(dialBody.to_number, '+34931234567');
+  const override = dialBody.conversation_initiation_client_data.conversation_config_override.agent;
+  assert.strictEqual(override.language, 'es');
+  assert.strictEqual(override.first_message, 'Hola, soy un asistente de IA y llamo de parte de Eugene.');
+  assert.ok(override.prompt.prompt.includes('Book a GP appointment') && override.prompt.prompt.includes('on behalf of Eugene'));
+  assert.ok(override.prompt.prompt.includes('Never give or take payment card details'));
+  assert.strictEqual(dialBody.conversation_initiation_client_data.dynamic_variables.tg_chat_id, '1');
+  assert.ok(tgCalls('editMessageText')[0].text.endsWith('Звоню. Итог и расшифровку пришлю сюда.'));
+
+  // second tap on the same button does not dial again
+  await press({ id: 1 }, goData, out[0]);
+  assert.ok(!calls.some((c) => c.url.includes('elevenlabs.io')));
+  assert.strictEqual(tgCalls('answerCallbackQuery')[0].text, 'Задание устарело.');
+
+  // cancel
+  out = await send({ id: 1 }, { text: '/call +34931234567 запиши меня к терапевту' });
+  await press({ id: 1 }, tgCalls('sendMessage')[0].reply_markup.inline_keyboard[0][1].callback_data, out[0]);
+  assert.ok(!calls.some((c) => c.url.includes('elevenlabs.io')));
+  assert.ok(tgCalls('editMessageText')[0].text.endsWith('Отменено.'));
+
+  // /call as a reply to a transcribed voice note takes the brief from that message
+  out = await send({ id: 1 }, { text: '/call', reply_to_message: { message_id: 5, text: '🎤 Позвони в клинику +34 931 234 567 и запиши меня' } });
+  assert.ok(out[0].includes('Номер: +34931234567'));
+
+  // ---------- result webhook ----------
+  const { Readable } = require('node:stream');
+  const hook = (payload, signature) => {
+    calls.length = 0;
+    const raw = JSON.stringify(payload);
+    const req = Readable.from([Buffer.from(raw)]);
+    req.method = 'POST';
+    req.headers = { 'elevenlabs-signature': signature === undefined ? callsLib.sign(raw, 'whsec') : signature };
+    const r = mockRes();
+    return callResult(req, r).then(() => ({ status: r.statusCode, body: r.body, texts: tgCalls('sendMessage').map((m) => m.text) }));
+  };
+  const done = { type: 'post_call_transcription', event_timestamp: 1, data: {
+    agent_id: 'agent_1', conversation_id: 'conv_1', status: 'done',
+    transcript: [
+      { role: 'agent', message: 'Hola, soy un asistente de IA y llamo de parte de Eugene.' },
+      { role: 'user', message: 'Sí, mañana a las 10.' },
+    ],
+    metadata: { call_duration_secs: 75 },
+    conversation_initiation_client_data: { dynamic_variables: { tg_chat_id: '1' } },
+  } };
+
+  let hooked = await hook(done, 't=1,v0=' + '0'.repeat(64));
+  assert.strictEqual(hooked.status, 401);
+  assert.deepStrictEqual(hooked.texts, []);
+
+  hooked = await hook(done);
+  assert.strictEqual(hooked.status, 200);
+  assert.strictEqual(hooked.texts.length, 2);
+  assert.ok(hooked.texts[0].startsWith('📞 Звонок на +34931234567 завершён, 1:15.') && hooked.texts[0].includes('Итог: цель достигнута.'));
+  assert.ok(hooked.texts[1].startsWith('🎤 Бот: Hola') && hooked.texts[1].includes('Собеседник: Sí, mañana a las 10.'));
+  assert.strictEqual(tgCalls('sendMessage')[0].chat_id, 1);
+
+  // ElevenLabs retry of the same event is not reported twice
+  hooked = await hook(done);
+  assert.strictEqual(hooked.body, 'duplicate');
+  assert.deepStrictEqual(hooked.texts, []);
+
+  // nobody spoke: no model call, plain note
+  hooked = await hook({ ...done, data: { ...done.data, conversation_id: 'conv_2', transcript: [done.data.transcript[0]] } });
+  assert.ok(hooked.texts[0].includes('Собеседника не было слышно'));
+  assert.ok(!calls.some((c) => c.url.includes('chat/completions')));
+  assert.strictEqual(tgCalls('sendMessage')[0].chat_id, '1'); // unknown call: falls back to the echoed chat id
+
+  // call never connected
+  hooked = await hook({ type: 'call_initiation_failure', event_timestamp: 1, data: { agent_id: 'agent_1', conversation_id: 'conv_1',
+    failure_reason: 'busy', metadata: { type: 'sip', body: { to_number: '+34931234567', sip_status_code: 486, sip_status: 'Busy here' } } } });
+  assert.deepStrictEqual(hooked.texts, ['📞 Не дозвонился на +34931234567: занято (SIP 486 Busy here).']);
+
+  // other event types are acknowledged and ignored
+  hooked = await hook({ type: 'post_call_audio', data: { conversation_id: 'conv_1' } });
+  assert.strictEqual(hooked.body, 'ignored');
+
+  // without the secret nothing is processed
+  delete process.env.ELEVENLABS_WEBHOOK_SECRET;
+  hooked = await hook(done);
+  assert.strictEqual(hooked.status, 503);
 
   console.log('all tests passed');
 })().catch((e) => { console.error(e); process.exit(1); });

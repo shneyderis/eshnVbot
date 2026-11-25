@@ -18,12 +18,13 @@
 //   SUMMARY_MIN_CHARS        only summarize transcripts longer than this (default 300)
 //
 // Commands: /start, /help, /join <word>; as a reply to a bot message: /tr <lang> translates it, /sum summarizes it.
-// Admin: /users, /ban <id>, /unban <id>.
+// Admin: /users, /ban <id>, /unban <id>, /call <brief> (outbound phone call by an AI agent, see lib/calls.js).
 //
 // Access rule: if no ADMIN_USER_IDS, ALLOWED_USER_IDS and no Redis are configured, everyone is allowed.
 // Otherwise a user must be an admin, in ALLOWED_USER_IDS, or registered via /join (and not banned).
 
 const store = require('../lib/store');
+const calls = require('../lib/calls');
 
 const TG_API = 'https://api.telegram.org';
 const OPENAI_API = 'https://api.openai.com/v1/audio/transcriptions';
@@ -168,6 +169,8 @@ const ADMIN_HELP = [
   '/users — кто зарегистрирован',
   '/ban <id> — удалить и заблокировать',
   '/unban <id> — разблокировать',
+  '/call <номер и задание> — позвонить за меня. Можно ответом на расшифрованное голосовое.',
+  '  Например: /call +34931234567 запиши меня к терапевту на следующую неделю, утром',
 ].join('\n');
 
 // Command menu shown by Telegram under the "/" button. Best effort, ignored on failure.
@@ -252,6 +255,85 @@ async function handleAdmin(msg, cmd, arg) {
   } else {
     await store.unban(id);
     await sendText(chatId, `${id} разблокирован. Для доступа ему нужно снова /join.`);
+  }
+}
+
+const CALL_USAGE = [
+  'Напиши номер и задание:',
+  '/call +34931234567 запиши меня к терапевту на следующую неделю, утром',
+  '',
+  'Или ответь командой /call на сообщение с заданием (например, на расшифрованное голосовое).',
+].join('\n');
+
+// "/call <brief>": plan the call and ask for confirmation. Nothing is dialed here.
+async function handleCall(msg, arg) {
+  const chatId = msg.chat.id;
+  const missing = calls.missingConfig();
+  if (missing.length) {
+    await sendText(chatId, `Звонки не настроены. Не хватает: ${missing.join(', ')}.`);
+    return;
+  }
+  const replied = msg.reply_to_message && msg.reply_to_message.text;
+  const brief = [arg.trim(), replied ? stripPrefix(replied) : ''].filter(Boolean).join('\n');
+  if (!brief) {
+    await sendText(chatId, CALL_USAGE);
+    return;
+  }
+  await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+  const plan = await calls.planCall(chat, brief);
+  if (!plan.number) {
+    await sendText(chatId, 'Не нашёл номер. Укажи его в международном формате, например +34931234567.', msg.message_id);
+    return;
+  }
+  if (!plan.task) {
+    await sendText(chatId, 'Не понял, что нужно сказать. Опиши задание подробнее.', msg.message_id);
+    return;
+  }
+  const id = await calls.savePlan(plan, { chatId, replyTo: msg.message_id });
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: calls.planSummary(plan),
+    reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
+    reply_markup: { inline_keyboard: [[
+      { text: '✅ Звонить', callback_data: `call:go:${id}` },
+      { text: '❌ Отмена', callback_data: `call:no:${id}` },
+    ]] },
+  });
+}
+
+// Taps on the "Звонить / Отмена" buttons under a call plan.
+async function handleCallback(query) {
+  const m = /^call:(go|no):([0-9a-f]{16})$/.exec(query.data || '');
+  const message = query.message;
+  const answer = (text) => tg('answerCallbackQuery', { callback_query_id: query.id, text }).catch(() => {});
+  if (!m || !message) return answer();
+  if (!isAdmin(query.from && query.from.id)) return answer('Только для админа.');
+
+  const chatId = message.chat.id;
+  const finish = (note) => tg('editMessageText', {
+    chat_id: chatId,
+    message_id: message.message_id,
+    text: `${message.text || '📞'}\n\n${note}`,
+  }).catch(() => {});
+
+  const saved = await calls.takePlan(m[2]);
+  if (!saved) {
+    await answer('Задание устарело.');
+    await finish('Задание устарело или уже обработано. Отправь /call ещё раз.');
+    return;
+  }
+  if (m[1] === 'no') {
+    await answer('Отменено.');
+    await finish('Отменено.');
+    return;
+  }
+  await answer('Звоню…');
+  try {
+    await calls.startCall(saved.plan, { chatId: saved.chatId, replyTo: saved.replyTo });
+    await finish('Звоню. Итог и расшифровку пришлю сюда.');
+  } catch (e) {
+    console.error('startCall failed', e);
+    await finish(`Не удалось начать звонок: ${e.message}`);
   }
 }
 
@@ -397,6 +479,15 @@ async function handleMessage(msg) {
     await handleAdmin(msg, command, arg);
     return;
   }
+  if (command === 'call') {
+    // Admin only: calls cost money and go out from the owner's phone number.
+    if (!isAdmin(userId)) {
+      await sendText(chatId, 'Только для админа.');
+      return;
+    }
+    await handleCall(msg, arg);
+    return;
+  }
   if (!(await isAllowed(userId))) {
     await sendText(chatId, `Нет доступа. Если у тебя есть кодовое слово: /join слово\nТвой id: ${userId}`);
     return;
@@ -478,6 +569,12 @@ async function handler(req, res) {
       console.error('handleMessage failed', e);
       await sendText(msg.chat.id, `Ошибка: ${e.message}`, msg.message_id).catch(() => {});
     }
+  } else if (update.callback_query) {
+    try {
+      await handleCallback(update.callback_query);
+    } catch (e) {
+      console.error('handleCallback failed', e);
+    }
   }
   // Always 200 so Telegram doesn't retry the same update.
   return res.status(200).send('ok');
@@ -491,3 +588,7 @@ module.exports.chunk = chunk;
 module.exports.isAllowed = isAllowed;
 module.exports.isAdmin = isAdmin;
 module.exports.langName = langName;
+module.exports.chat = chat;
+module.exports.sendText = sendText;
+module.exports.sendLong = sendLong;
+module.exports.idList = idList;

@@ -1,5 +1,6 @@
 {
   "functions": {
-    "api/telegram.js": { "maxDuration": 60 }
+    "api/telegram.js": { "maxDuration": 60 },
+    "api/call-result.js": { "maxDuration": 60 }
   }
 }
