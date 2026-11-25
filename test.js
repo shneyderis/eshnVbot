@@ -60,6 +60,15 @@ assert.strictEqual(
   'Бот: Hola\nСобеседник: Sí',
 );
 assert.ok(!callsLib.heardAnyone([{ role: 'agent', message: 'Hola' }]));
+assert.strictEqual(callsLib.formatTranscript([{ role: 'agent', message: 'Отлично, спасибо! [happy] Значит, связь хорошая.' }]),
+  'Бот: Отлично, спасибо! Значит, связь хорошая.');
+// a number copied from a contact card comes wrapped in invisible direction marks
+assert.strictEqual(callsLib.normalizeNumber('\u202a+34 656 62 45 94\u202c'), '+34656624594');
+assert.strictEqual(callsLib.leadingNumber('\u202a+34 656 62 45 94\u202c позвони'), '+34656624594');
+// "/call" that starts with something invisible, or with a look-alike slash, is still a command
+assert.strictEqual(bot.cleanCommandText('\u200b/call +34656624594 позвони'), '/call +34656624594 позвони');
+assert.strictEqual(bot.cleanCommandText('\u200e \uff0fcall x'), '/call x');
+assert.strictEqual(bot.cleanCommandText('  обычный текст '), 'обычный текст');
 assert.strictEqual(
   callsLib.failureText({ failure_reason: 'busy', metadata: { type: 'sip', body: { sip_status_code: 486, sip_status: 'Busy here' } } }),
   'занято (SIP 486 Busy here)',
@@ -415,6 +424,18 @@ function mockRes() {
   assert.ok(bot.isCallBrief({ voice: {}, from: { id: 1 } }, 'набери ресторан'));
   assert.ok(!bot.isCallBrief({ voice: {}, from: { id: 1 } }, 'Мне позвонили из банка'));
   assert.ok(!bot.isCallBrief({ voice: {}, from: { id: 1 } }, 'called him yesterday'));
+
+  // "/call" with an invisible character in front still plans a call
+  out = await send({ id: 1 }, { text: '\u200b/call +34931234567 запиши меня к терапевту' });
+  assert.ok(out[0].includes('Номер: +34931234567') && hasPlan());
+
+  // the admin can write the brief as plain text, without /call; others cannot
+  out = await send({ id: 1 }, { text: 'Позвони в клинику +34 931 234 567 и запиши меня' });
+  assert.ok(out[0].includes('Номер: +34931234567') && hasPlan());
+  out = await send({ id: 42 }, { text: 'Позвони в клинику +34 931 234 567 и запиши меня' });
+  assert.deepStrictEqual(out, ['Пришли голосовое, аудиофайл, видео или картинку с текстом.']);
+  out = await send({ id: 1 }, { text: 'зачем ?' });
+  assert.deepStrictEqual(out, ['Пришли голосовое, аудиофайл, видео или картинку с текстом.']);
 
   // ---------- /call by name ----------
   const usedWebSearch = () => calls.some((c) => c.url === 'https://api.openai.com/v1/responses');
