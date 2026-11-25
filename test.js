@@ -60,6 +60,10 @@ assert.strictEqual(
   'Бот: Hola\nСобеседник: Sí',
 );
 assert.ok(!callsLib.heardAnyone([{ role: 'agent', message: 'Hola' }]));
+// "..." turns are silence on the other side, not speech
+assert.ok(!callsLib.heardAnyone([{ role: 'user', message: '...' }, { role: 'agent', message: 'Алло?' }, { role: 'user', message: '…' }]));
+assert.strictEqual(callsLib.formatTranscript([{ role: 'user', message: '...' }, { role: 'agent', message: '[neutral] Алло, вы меня слышите?' }]),
+  'Бот: Алло, вы меня слышите?');
 assert.strictEqual(callsLib.formatTranscript([{ role: 'agent', message: 'Отлично, спасибо! [happy] Значит, связь хорошая.' }]),
   'Бот: Отлично, спасибо! Значит, связь хорошая.');
 // a number copied from a contact card comes wrapped in invisible direction marks
