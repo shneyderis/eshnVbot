@@ -177,16 +177,31 @@ const ADMIN_HELP = [
   '/forget <название> — забыть номер',
 ].join('\n');
 
+const COMMANDS = [
+  { command: 'help', description: 'Что умею и команды' },
+  { command: 'tr', description: 'Перевести (ответом на сообщение): /tr en' },
+  { command: 'sum', description: 'Короткий пересказ (ответом на сообщение)' },
+  { command: 'join', description: 'Получить доступ: /join кодовое слово' },
+];
+
+const ADMIN_COMMANDS = [
+  { command: 'call', description: 'Позвонить за меня: /call номер или название и задание' },
+  { command: 'contacts', description: 'Номера, которые бот запомнил' },
+  { command: 'forget', description: 'Забыть номер: /forget название' },
+  { command: 'users', description: 'Кто добавлен через /join' },
+];
+
 // Command menu shown by Telegram under the "/" button. Best effort, ignored on failure.
-function registerCommands() {
-  return tg('setMyCommands', {
-    commands: [
-      { command: 'help', description: 'Что умею и команды' },
-      { command: 'tr', description: 'Перевести (ответом на сообщение): /tr en' },
-      { command: 'sum', description: 'Короткий пересказ (ответом на сообщение)' },
-      { command: 'join', description: 'Получить доступ: /join кодовое слово' },
-    ],
-  }).catch(() => {});
+// An admin gets the admin commands on top, in his own chat with the bot only.
+function registerCommands(userId) {
+  const jobs = [tg('setMyCommands', { commands: COMMANDS }).catch(() => {})];
+  if (isAdmin(userId)) {
+    jobs.push(tg('setMyCommands', {
+      commands: [...ADMIN_COMMANDS, ...COMMANDS],
+      scope: { type: 'chat', chat_id: userId },
+    }).catch(() => {}));
+  }
+  return Promise.all(jobs);
 }
 
 function idList(name) {
@@ -296,7 +311,14 @@ async function handleCall(msg, arg) {
     await sendText(chatId, 'Не понял, что нужно сказать. Опиши задание подробнее.', msg.message_id);
     return;
   }
-  const id = await calls.savePlan(plan, { chatId, replyTo: msg.message_id });
+  let id;
+  try {
+    id = await calls.savePlan(plan, { chatId, replyTo: msg.message_id });
+  } catch (e) {
+    console.error('savePlan failed', e);
+    await sendText(chatId, 'Хранилище (Redis) недоступно, план звонка сохранить негде. Проверь базу в Vercel → Storage.', msg.message_id);
+    return;
+  }
   await tg('sendMessage', {
     chat_id: chatId,
     text: calls.planSummary(plan),
@@ -500,7 +522,7 @@ async function handleMessage(msg) {
   const arg = cmd ? cmd[2] || '' : '';
 
   if (command === 'start' || command === 'help') {
-    await registerCommands();
+    await registerCommands(userId);
     const extra = isAdmin(userId) ? ADMIN_HELP : '';
     await sendText(chatId, `${HELP}${extra}\n\nТвой Telegram id: ${userId}`);
     return;

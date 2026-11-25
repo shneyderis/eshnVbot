@@ -273,8 +273,17 @@ function mockRes() {
   out = await send({ id: 1 }, { text: '/help' });
   assert.ok(out[0].includes('/tr <язык>') && out[0].includes('/ban <id>') && out[0].includes('id: 1'));
   assert.ok(calls.some((c) => c.url.includes('/setMyCommands')));
+  // the admin's own chat gets /call and friends in the menu; the default menu stays without them
+  let menus = calls.filter((c) => c.url.includes('/setMyCommands')).map((c) => JSON.parse(c.opts.body));
+  assert.strictEqual(menus.length, 2);
+  assert.ok(!menus.find((m) => !m.scope).commands.some((c) => c.command === 'call'));
+  const adminMenu = menus.find((m) => m.scope);
+  assert.deepStrictEqual(adminMenu.scope, { type: 'chat', chat_id: 1 });
+  assert.deepStrictEqual(adminMenu.commands.slice(0, 3).map((c) => c.command), ['call', 'contacts', 'forget']);
   out = await send(stranger, { text: '/start' });
   assert.ok(out[0].includes('/join') && !out[0].includes('/ban'));
+  menus = calls.filter((c) => c.url.includes('/setMyCommands')).map((c) => JSON.parse(c.opts.body));
+  assert.ok(menus.length === 1 && !menus[0].scope);
 
   // oversized file is rejected before download
   out = await send({ id: 42 }, { video: { file_id: 'x', file_size: 30 * 1024 * 1024 } });
