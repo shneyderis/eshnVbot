@@ -27,18 +27,17 @@ function duration(secs) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-// Where to send the result: the chat stored when the call started, else the id echoed back
-// by ElevenLabs, else the first admin.
-async function destination(data) {
-  const saved = await calls.findCall(data.conversation_id).catch(() => null);
-  if (saved && saved.chatId) return saved;
-  const vars = (data.conversation_initiation_client_data || {}).dynamic_variables || {};
-  const chatId = vars.tg_chat_id || bot.idList('ADMIN_USER_IDS')[0];
+// Where to send the result: the chat that travelled with the call, else the first admin.
+// A failure event carries no such variables, so it always goes to the first admin.
+function destination(data) {
+  const context = calls.callContext(data);
+  if (context) return context;
+  const chatId = bot.idList('ADMIN_USER_IDS')[0];
   return chatId ? { chatId } : null;
 }
 
 async function onTranscript(data) {
-  const to = await destination(data);
+  const to = destination(data);
   if (!to) return;
   const head = `📞 Звонок${to.number ? ` на ${to.number}` : ''} завершён, ${duration((data.metadata || {}).call_duration_secs)}.`;
   const text = calls.formatTranscript(data.transcript);
@@ -47,14 +46,14 @@ async function onTranscript(data) {
     if (text) await bot.sendLong(to.chatId, `🎤 ${text}`, to.replyTo);
     return;
   }
-  const summary = await calls.report(bot.chat, to.goal, text);
+  const summary = await calls.report(bot.chat, to.task, text);
   await bot.sendLong(to.chatId, `${head}\n\n${summary}`, to.replyTo);
   // Same "🎤" prefix as transcribed voice notes, so /tr and /sum work on it as a reply.
   await bot.sendLong(to.chatId, `🎤 ${text}`, to.replyTo);
 }
 
 async function onFailure(data) {
-  const to = await destination(data);
+  const to = destination(data);
   if (!to) return;
   const number = to.number || ((data.metadata || {}).body || {}).to_number || '';
   await bot.sendText(to.chatId, `📞 Не дозвонился${number ? ` на ${number}` : ''}: ${calls.failureText(data)}.`, to.replyTo);

@@ -311,21 +311,15 @@ async function handleCall(msg, arg) {
     await sendText(chatId, 'Не понял, что нужно сказать. Опиши задание подробнее.', msg.message_id);
     return;
   }
-  let id;
-  try {
-    id = await calls.savePlan(plan, { chatId, replyTo: msg.message_id });
-  } catch (e) {
-    console.error('savePlan failed', e);
-    await sendText(chatId, 'Хранилище (Redis) недоступно, план звонка сохранить негде. Проверь базу в Vercel → Storage.', msg.message_id);
-    return;
-  }
+  // The plan is kept in this message: the button handler reads it back with calls.parsePlan().
   await tg('sendMessage', {
     chat_id: chatId,
-    text: calls.planSummary(plan),
+    text: calls.planSummary(plan).slice(0, 4000),
     reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
+    link_preview_options: { is_disabled: true },
     reply_markup: { inline_keyboard: [[
-      { text: '✅ Звонить', callback_data: `call:go:${id}` },
-      { text: '❌ Отмена', callback_data: `call:no:${id}` },
+      { text: '✅ Звонить', callback_data: 'call:go' },
+      { text: '❌ Отмена', callback_data: 'call:no' },
     ]] },
   });
 }
@@ -341,34 +335,46 @@ function isCallBrief(msg, text) {
 
 // Taps on the "Звонить / Отмена" buttons under a call plan.
 async function handleCallback(query) {
-  const m = /^call:(go|no):([0-9a-f]{16})$/.exec(query.data || '');
+  const m = /^call:(go|no)(?::[0-9a-f]{16})?$/.exec(query.data || '');
   const message = query.message;
   const answer = (text) => tg('answerCallbackQuery', { callback_query_id: query.id, text }).catch(() => {});
-  if (!m || !message) return answer();
+  if (!m || !message || !message.chat) return answer();
   if (!isAdmin(query.from && query.from.id)) return answer('Только для админа.');
 
   const chatId = message.chat.id;
   const finish = (note) => tg('editMessageText', {
     chat_id: chatId,
     message_id: message.message_id,
-    text: `${message.text || '📞'}\n\n${note}`,
+    text: `${message.text || '📞'}\n\n${note}`.slice(0, 4096),
+    link_preview_options: { is_disabled: true },
   }).catch(() => {});
 
-  const saved = await calls.takePlan(m[2]);
-  if (!saved) {
-    await answer('Задание устарело.');
-    await finish('Задание устарело или уже обработано. Отправь /call ещё раз.');
-    return;
+  // Taking the buttons away is the lock: Telegram refuses to remove them twice,
+  // so a second tap on the same plan stops here and cannot dial again.
+  try {
+    await tg('editMessageReplyMarkup', {
+      chat_id: chatId, message_id: message.message_id, reply_markup: { inline_keyboard: [] },
+    });
+  } catch (_) {
+    return answer('Уже обработано.');
   }
+
   if (m[1] === 'no') {
     await answer('Отменено.');
     await finish('Отменено.');
     return;
   }
+  const plan = calls.parsePlan(message.text);
+  if (!plan) {
+    await answer('Не смог прочитать план.');
+    await finish('Не смог прочитать план. Отправь /call ещё раз.');
+    return;
+  }
   await answer('Звоню…');
   try {
-    await calls.rememberPlace(saved.plan);
-    await calls.startCall(saved.plan, { chatId: saved.chatId, replyTo: saved.replyTo });
+    await calls.rememberPlace(plan);
+    const replyTo = message.reply_to_message && message.reply_to_message.message_id;
+    await calls.startCall(plan, { chatId, replyTo });
     await finish('Звоню. Итог и расшифровку пришлю сюда.');
   } catch (e) {
     console.error('startCall failed', e);
