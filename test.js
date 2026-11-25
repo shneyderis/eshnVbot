@@ -69,6 +69,8 @@ assert.strictEqual(
 const calls = [];
 let dialed = 0;
 let spoken = 'Привет, это тест.\n'; // what the mocked speech recognition "hears"
+let redisDown = false;
+const unlocked = new Set(); // plan messages whose buttons were already removed
 // in-memory fake of the two Redis structures the bot uses
 const redisHashes = { users: {}, contacts: {} };
 const redisBanned = new Set();
@@ -97,12 +99,20 @@ global.fetch = async (url, opts = {}) => {
   calls.push({ url: String(url), opts });
   const json = (obj) => ({ ok: true, status: 200, json: async () => obj, text: async () => JSON.stringify(obj) });
   if (url === 'https://redis.example') {
+    if (redisDown) throw new TypeError('fetch failed'); // e.g. the database was archived
     assert.strictEqual(opts.headers.authorization, 'Bearer R');
     return json({ result: fakeRedis(JSON.parse(opts.body)) });
   }
   if (url.includes('/getFile')) return json({ ok: true, result: { file_path: 'documents/file_0.opus' } });
   if (url.includes('/sendMessage') || url.includes('/sendChatAction') || url.includes('/setMyCommands')) return json({ ok: true, result: {} });
   if (url.includes('/answerCallbackQuery') || url.includes('/editMessageText')) return json({ ok: true, result: {} });
+  if (url.includes('/editMessageReplyMarkup')) {
+    // like Telegram: removing buttons that are already gone is an error
+    const id = JSON.parse(opts.body).message_id;
+    if (unlocked.has(id)) return json({ ok: false, description: 'Bad Request: message is not modified' });
+    unlocked.add(id);
+    return json({ ok: true, result: {} });
+  }
   if (url === 'https://api.openai.com/v1/responses') {
     const body = JSON.parse(opts.body);
     assert.deepStrictEqual(body.tools, [{ type: 'web_search' }]);
@@ -296,10 +306,12 @@ function mockRes() {
 
   // ---------- /call ----------
   const tgCalls = (method) => calls.filter((c) => c.url.includes('/' + method)).map((c) => JSON.parse(c.opts.body));
-  const press = (from, data, text) => {
+  let planMessageId = 100;
+  const press = (from, data, text, messageId = ++planMessageId) => {
     calls.length = 0;
     return bot({ method: 'POST', headers: { 'x-telegram-bot-api-secret-token': 'S' },
-      body: { callback_query: { id: 'cb', from, data, message: { message_id: 77, chat: { id: from.id }, text } } } }, mockRes());
+      body: { callback_query: { id: 'cb', from, data,
+        message: { message_id: messageId, chat: { id: from.id }, text, reply_to_message: { message_id: 5 } } } } }, mockRes());
   };
 
   // only the admin may call
@@ -327,15 +339,16 @@ function mockRes() {
   const buttons = tgCalls('sendMessage')[0].reply_markup.inline_keyboard[0];
   assert.deepStrictEqual(buttons.map((b) => b.text), ['✅ Звонить', '❌ Отмена']);
   const goData = buttons[0].callback_data;
-  assert.ok(/^call:go:[0-9a-f]{16}$/.test(goData));
+  assert.strictEqual(goData, 'call:go');
+  assert.ok(out[0].includes('Задание агенту:\nBook a GP appointment for tomorrow morning.'));
 
   // a non-admin cannot press the button
   await press({ id: 42 }, goData, out[0]);
   assert.ok(!calls.some((c) => c.url.includes('elevenlabs.io')));
   assert.strictEqual(tgCalls('answerCallbackQuery')[0].text, 'Только для админа.');
 
-  // admin confirms: ElevenLabs is asked to dial with the plan
-  await press({ id: 1 }, goData, out[0]);
+  // admin confirms: ElevenLabs is asked to dial with the plan read back from the message
+  await press({ id: 1 }, goData, out[0], 500);
   const dial = calls.filter((c) => c.url.includes('elevenlabs.io'));
   assert.strictEqual(dial.length, 1);
   assert.strictEqual(dial[0].url, 'https://api.elevenlabs.io/v1/convai/sip-trunk/outbound-call');
@@ -349,13 +362,20 @@ function mockRes() {
   assert.ok(override.prompt.prompt.includes('Hola, soy un asistente de IA y llamo de parte de Eugene.'));
   assert.ok(override.prompt.prompt.includes('Book a GP appointment') && override.prompt.prompt.includes('on behalf of Eugene'));
   assert.ok(override.prompt.prompt.includes('Never give or take payment card details'));
-  assert.strictEqual(dialBody.conversation_initiation_client_data.dynamic_variables.tg_chat_id, '1');
+  assert.deepStrictEqual(dialBody.conversation_initiation_client_data.dynamic_variables, {
+    tg_chat_id: '1', tg_reply_to: '5', call_number: '+34931234567', call_task: 'Book a GP appointment for tomorrow morning.',
+  });
   assert.ok(tgCalls('editMessageText')[0].text.endsWith('Звоню. Итог и расшифровку пришлю сюда.'));
 
-  // second tap on the same button does not dial again
-  await press({ id: 1 }, goData, out[0]);
+  // second tap on the same message does not dial again
+  await press({ id: 1 }, goData, out[0], 500);
   assert.ok(!calls.some((c) => c.url.includes('elevenlabs.io')));
-  assert.strictEqual(tgCalls('answerCallbackQuery')[0].text, 'Задание устарело.');
+  assert.strictEqual(tgCalls('answerCallbackQuery')[0].text, 'Уже обработано.');
+
+  // a message that is not a plan is never dialed
+  await press({ id: 1 }, goData, 'Номер: +34931234567\nпросто текст');
+  assert.ok(!calls.some((c) => c.url.includes('elevenlabs.io')));
+  assert.ok(tgCalls('editMessageText')[0].text.endsWith('Не смог прочитать план. Отправь /call ещё раз.'));
 
   // cancel
   out = await send({ id: 1 }, { text: '/call +34931234567 запиши меня к терапевту' });
@@ -445,7 +465,9 @@ function mockRes() {
       { role: 'user', message: 'Sí, mañana a las 10.' },
     ],
     metadata: { call_duration_secs: 75 },
-    conversation_initiation_client_data: { dynamic_variables: { tg_chat_id: '1' } },
+    conversation_initiation_client_data: { dynamic_variables: {
+      tg_chat_id: '1', tg_reply_to: '5', call_number: '+34931234567', call_task: 'Записаться к терапевту.', system__agent_id: 'agent_1',
+    } },
   } };
 
   let hooked = await hook(done, 't=1,v0=' + '0'.repeat(64));
@@ -457,7 +479,8 @@ function mockRes() {
   assert.strictEqual(hooked.texts.length, 2);
   assert.ok(hooked.texts[0].startsWith('📞 Звонок на +34931234567 завершён, 1:15.') && hooked.texts[0].includes('Итог: цель достигнута.'));
   assert.ok(hooked.texts[1].startsWith('🎤 Бот: Hola') && hooked.texts[1].includes('Собеседник: Sí, mañana a las 10.'));
-  assert.strictEqual(tgCalls('sendMessage')[0].chat_id, 1);
+  assert.strictEqual(tgCalls('sendMessage')[0].chat_id, '1');
+  assert.strictEqual(tgCalls('sendMessage')[0].reply_parameters.message_id, 5);
 
   // ElevenLabs retry of the same event is not reported twice
   hooked = await hook(done);
@@ -468,12 +491,28 @@ function mockRes() {
   hooked = await hook({ ...done, data: { ...done.data, conversation_id: 'conv_unknown', transcript: [done.data.transcript[0]] } });
   assert.ok(hooked.texts[0].includes('Собеседника не было слышно'));
   assert.ok(!calls.some((c) => c.url.includes('chat/completions')));
-  assert.strictEqual(tgCalls('sendMessage')[0].chat_id, '1'); // unknown call: falls back to the echoed chat id
+
+  // a result without our variables goes to the first admin
+  hooked = await hook({ ...done, data: { ...done.data, conversation_id: 'conv_foreign', conversation_initiation_client_data: {} } });
+  assert.strictEqual(tgCalls('sendMessage')[0].chat_id, '1');
+  assert.ok(hooked.texts[0].startsWith('📞 Звонок завершён, 1:15.'));
 
   // call never connected
   hooked = await hook({ type: 'call_initiation_failure', event_timestamp: 1, data: { agent_id: 'agent_1', conversation_id: 'conv_1',
     failure_reason: 'busy', metadata: { type: 'sip', body: { to_number: '+34931234567', sip_status_code: 486, sip_status: 'Busy here' } } } });
   assert.deepStrictEqual(hooked.texts, ['📞 Не дозвонился на +34931234567: занято (SIP 486 Busy here).']);
+
+  // ---------- the store is down (archived database): calls still work ----------
+  redisDown = true;
+  out = await send({ id: 1 }, { text: '/call +34931234567 запиши меня к терапевту завтра утром' });
+  assert.ok(out[0].includes('Номер: +34931234567') && hasPlan());
+  await press({ id: 1 }, 'call:go', out[0]);
+  assert.strictEqual(calls.filter((c) => c.url.includes('elevenlabs.io')).length, 1);
+  out = await send({ id: 1 }, { text: '/call позвони в ресторан Disfrutar в Барселоне' });
+  assert.ok(usedWebSearch() && out[0].includes('Номер: +34933486896'));
+  hooked = await hook({ ...done, data: { ...done.data, conversation_id: 'conv_down' } });
+  assert.strictEqual(hooked.texts.length, 2);
+  redisDown = false;
 
   // other event types are acknowledged and ignored
   hooked = await hook({ type: 'post_call_audio', data: { conversation_id: 'conv_1' } });
