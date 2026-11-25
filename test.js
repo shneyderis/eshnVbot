@@ -68,6 +68,7 @@ assert.strictEqual(
 // --- end-to-end with mocked network ---
 const calls = [];
 let dialed = 0;
+let spoken = 'Привет, это тест.\n'; // what the mocked speech recognition "hears"
 // in-memory fake of the two Redis structures the bot uses
 const redisHashes = { users: {}, contacts: {} };
 const redisBanned = new Set();
@@ -151,7 +152,7 @@ global.fetch = async (url, opts = {}) => {
     assert.ok(opts.body instanceof FormData);
     assert.strictEqual(opts.body.get('file').name, 'audio.ogg');
     assert.strictEqual(opts.body.get('model'), 'gpt-4o-transcribe');
-    return { ok: true, status: 200, text: async () => 'Привет, это тест.\n' };
+    return { ok: true, status: 200, text: async () => spoken };
   }
   throw new Error('unexpected url ' + url);
 };
@@ -356,6 +357,35 @@ function mockRes() {
   // /call as a reply to a transcribed voice note takes the brief from that message
   out = await send({ id: 1 }, { text: '/call', reply_to_message: { message_id: 5, text: '🎤 Позвони в клинику +34 931 234 567 и запиши меня' } });
   assert.ok(out[0].includes('Номер: +34931234567'));
+
+  // ---------- call brief by voice ----------
+  const hasPlan = () => tgCalls('sendMessage').some((m) => m.reply_markup);
+  spoken = 'Позвони в клинику +34 931 234 567 и запиши меня к терапевту.\n';
+  out = await send({ id: 1 }, { voice: { file_id: 'v' } });
+  assert.strictEqual(out[0], '🎤 Позвони в клинику +34 931 234 567 и запиши меня к терапевту.');
+  assert.ok(out[1].includes('Номер: +34931234567') && hasPlan());
+  assert.ok(!calls.some((c) => c.url.includes('elevenlabs.io'))); // still waits for the button
+
+  // a forwarded voice note is somebody else's words: transcript only
+  out = await send({ id: 1 }, { voice: { file_id: 'v' }, forward_origin: { type: 'user' } });
+  assert.deepStrictEqual(out, ['Позвони в клинику +34 931 234 567 и запиши меня к терапевту.']);
+  assert.ok(!hasPlan());
+
+  // not the admin: transcript only
+  out = await send({ id: 42 }, { voice: { file_id: 'v' } });
+  assert.ok(out.length === 1 && !hasPlan());
+
+  // an uploaded audio file is not a brief either
+  out = await send({ id: 1 }, { audio: { file_id: 'v', file_name: 'audio.ogg' } });
+  assert.ok(out.length === 1 && !hasPlan());
+
+  // the admin's ordinary voice note is transcribed as before
+  spoken = 'Привет, это тест.\n';
+  out = await send({ id: 1 }, { voice: { file_id: 'v' } });
+  assert.deepStrictEqual(out, ['Привет, это тест.']);
+  assert.ok(bot.isCallBrief({ voice: {}, from: { id: 1 } }, 'набери ресторан'));
+  assert.ok(!bot.isCallBrief({ voice: {}, from: { id: 1 } }, 'Мне позвонили из банка'));
+  assert.ok(!bot.isCallBrief({ voice: {}, from: { id: 1 } }, 'called him yesterday'));
 
   // ---------- /call by name ----------
   const usedWebSearch = () => calls.some((c) => c.url === 'https://api.openai.com/v1/responses');

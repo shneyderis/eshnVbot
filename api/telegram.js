@@ -170,7 +170,7 @@ const ADMIN_HELP = [
   '/users — кто зарегистрирован',
   '/ban <id> — удалить и заблокировать',
   '/unban <id> — разблокировать',
-  '/call <задание> — позвонить за меня. Можно ответом на расшифрованное голосовое.',
+  '/call <задание> — позвонить за меня. Или голосовым, которое начинается со слова «позвони».',
   '  С номером: /call +34931234567 запиши меня к терапевту на следующую неделю, утром',
   '  По названию: /call позвони в ресторан Disfrutar в Барселоне, стол на двоих в пятницу в 21:00',
   '/contacts — номера, которые бот запомнил',
@@ -267,7 +267,8 @@ const CALL_USAGE = [
   '/call +34931234567 запиши меня к терапевту на следующую неделю, утром',
   '/call позвони в ресторан Disfrutar в Барселоне, стол на двоих в пятницу в 21:00',
   '',
-  'Или ответь командой /call на сообщение с заданием (например, на расшифрованное голосовое).',
+  'Или наговори голосовое, которое начинается со слова «позвони».',
+  'Или ответь командой /call на сообщение с заданием.',
 ].join('\n');
 
 // "/call <brief>": plan the call and ask for confirmation. Nothing is dialed here.
@@ -305,6 +306,15 @@ async function handleCall(msg, arg) {
       { text: '❌ Отмена', callback_data: `call:no:${id}` },
     ]] },
   });
+}
+
+// A voice note the admin records himself and starts with "позвони…" is a call brief: no /call needed.
+// A forwarded voice note never is: those are other people's words ("позвони мне завтра").
+const CALL_TRIGGER = /^[\s"«„“]*(?:позвон|набер|подзвон|зателефон|call(?!\p{L}))/iu;
+
+function isCallBrief(msg, text) {
+  const own = (msg.voice || msg.video_note) && !msg.forward_origin && !msg.forward_date;
+  return Boolean(own) && isAdmin(msg.from && msg.from.id) && CALL_TRIGGER.test(text) && !calls.missingConfig().length;
 }
 
 // Taps on the "Звонить / Отмена" buttons under a call plan.
@@ -578,6 +588,12 @@ async function handleMessage(msg) {
     await sendText(chatId, 'Не удалось распознать речь.', msg.message_id);
     return;
   }
+  if (isCallBrief(msg, text)) {
+    // Show what was heard, then the plan with the confirm button. Nothing is dialed without the tap.
+    await sendLong(chatId, `🎤 ${text}`, msg.message_id);
+    await handleCall(msg, text);
+    return;
+  }
   await deliver(chatId, text, msg.message_id, '🎤');
 }
 
@@ -621,3 +637,4 @@ module.exports.chat = chat;
 module.exports.sendText = sendText;
 module.exports.sendLong = sendLong;
 module.exports.idList = idList;
+module.exports.isCallBrief = isCallBrief;
